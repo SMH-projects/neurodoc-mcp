@@ -8,7 +8,6 @@ version = "0.1.0"
 description = "AI navigation for codebases via context.md files. 17-119x faster than vector search."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
 keywords = ["mcp", "claude", "ai", "codebase", "navigation", "context", "claude-code"]
 classifiers = [
     "Development Status :: 4 - Beta",

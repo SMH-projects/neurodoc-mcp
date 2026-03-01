@@ -1,6 +1,5 @@
 # NeuroDoc MCP
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 
 AI navigation for codebases via `context.md` files. Instead of vector search — hierarchical maps of functions, dependencies, and C4 diagrams.
@@ -176,8 +175,3 @@ Or force refresh without clearing the full cache:
 uvx --from git+https://github.com/SMH-projects/neurodoc-mcp neurodoc-mcp --refresh
 ```
 
----
-
-## License
-
-MIT
