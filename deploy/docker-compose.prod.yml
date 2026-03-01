@@ -1,0 +1,49 @@
+services:
+  ndoc:
+    image: neurodoc-mcp:latest
+    container_name: neurodoc-mcp
+    restart: always
+    expose:
+      - "8000"
+    volumes:
+      - ${WORKSPACE_ROOT:-/workspace}:/workspace:rw
+    environment:
+      - NDOC_TRANSPORT=streamable-http
+      - NDOC_HOST=0.0.0.0
+      - NDOC_PORT=8000
+      - WORKSPACE_ROOT=/workspace
+    networks:
+      - ndoc-net
+
+  nginx:
+    image: nginx:alpine
+    container_name: ndoc-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /var/www/certbot:/var/www/certbot:ro
+    depends_on:
+      - ndoc
+    networks:
+      - ndoc-net
+
+  certbot:
+    image: certbot/certbot
+    container_name: ndoc-certbot
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt
+      - /var/www/certbot:/var/www/certbot
+    entrypoint: >
+      sh -c "trap exit TERM;
+             while :; do
+               certbot renew --webroot -w /var/www/certbot --quiet;
+               sleep 12h & wait $${!};
+             done"
+
+networks:
+  ndoc-net:
+    driver: bridge

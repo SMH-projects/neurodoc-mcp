@@ -1,0 +1,23 @@
+services:
+  ndoc:
+    build: .
+    image: neurodoc-mcp:latest
+    container_name: neurodoc-mcp
+    ports:
+      - "${NDOC_PORT:-8000}:8000"
+    volumes:
+      # Монтируй свой проект сюда:
+      # docker-compose up → сервер видит твой код через /workspace
+      - ${PROJECT_PATH:-/tmp}:/workspace:rw
+    environment:
+      - NDOC_TRANSPORT=streamable-http
+      - NDOC_HOST=0.0.0.0
+      - NDOC_PORT=8000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/mcp')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

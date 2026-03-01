@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neurodoc-mcp"
+version = "0.1.0"
+description = "AI navigation for codebases via context.md files. 17-119x faster than vector search."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "claude", "ai", "codebase", "navigation", "context", "claude-code"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/neurodoc-mcp"
+Repository = "https://github.com/YOUR_USERNAME/neurodoc-mcp"
+Issues = "https://github.com/YOUR_USERNAME/neurodoc-mcp/issues"
+
+[project.scripts]
+neurodoc-mcp = "neurodoc_mcp.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/neurodoc_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "README.md", "LICENSE"]
