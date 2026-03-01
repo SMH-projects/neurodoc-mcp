@@ -1,8 +1,7 @@
 # NeuroDoc MCP
 
-[![PyPI version](https://img.shields.io/pypi/v/neurodoc-mcp.svg)](https://pypi.org/project/neurodoc-mcp/)
-[![Python](https://img.shields.io/pypi/pyversions/neurodoc-mcp.svg)](https://pypi.org/project/neurodoc-mcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 
 AI navigation for codebases via `context.md` files. Instead of vector search — hierarchical maps of functions, dependencies, and C4 diagrams.
 
@@ -12,10 +11,10 @@ AI navigation for codebases via `context.md` files. Instead of vector search —
 
 ## Quick Start
 
-### Claude Code (recommended)
+### Claude Code
 
 ```bash
-claude mcp add ndoc -- uvx neurodoc-mcp
+claude mcp add ndoc -- uvx --from git+https://github.com/SMH-projects/neurodoc-mcp neurodoc-mcp
 ```
 
 Then in any project:
@@ -33,7 +32,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "ndoc": {
       "command": "uvx",
-      "args": ["neurodoc-mcp"]
+      "args": ["--from", "git+https://github.com/SMH-projects/neurodoc-mcp", "neurodoc-mcp"]
     }
   }
 }
@@ -48,7 +47,7 @@ Add to `.vscode/mcp.json` or `~/.cursor/mcp.json`:
   "servers": {
     "ndoc": {
       "command": "uvx",
-      "args": ["neurodoc-mcp"]
+      "args": ["--from", "git+https://github.com/SMH-projects/neurodoc-mcp", "neurodoc-mcp"]
     }
   }
 }
@@ -131,10 +130,6 @@ your-project/
 ## Alternative Installation
 
 ```bash
-# pip
-pip install neurodoc-mcp
-neurodoc-mcp
-
 # from source
 git clone https://github.com/SMH-projects/neurodoc-mcp
 cd neurodoc-mcp
