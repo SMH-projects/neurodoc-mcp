@@ -374,9 +374,11 @@ def make_context_md(dir_path: Path, root: Path, all_modules: list) -> str:
     files_data = scan_dir(dir_path)
     mod = short_name(dir_path, root)
 
-    # Parent directory: no direct code but has subdirs with code
+    # Check for subdirs with code (always, not only when files_data is empty)
+    children = child_subdirs_with_code(dir_path)
+
+    # Pure parent directory: no direct code files
     if not files_data:
-        children = child_subdirs_with_code(dir_path)
         if children:
             child_names = [c.name for c in children[:12]]
             lines = [
@@ -386,7 +388,6 @@ def make_context_md(dir_path: Path, root: Path, all_modules: list) -> str:
                 f"upd: {datetime.now().strftime('%Y-%m-%d')} ndoc",
             ]
             return '\n'.join(lines)
-        # truly empty
         return f"# {mod}\ntags: {mod}\nupd: {datetime.now().strftime('%Y-%m-%d')} ndoc"
 
     # Collect imports → compute module deps
@@ -416,6 +417,11 @@ def make_context_md(dir_path: Path, root: Path, all_modules: list) -> str:
                 entry += f"→{','.join(calls[:2])}"
             parts.append(entry)
         lines.append(f"{fname}: {' | '.join(parts)}")
+
+    # Add submodules line if has child dirs with code
+    if children:
+        child_names = [c.name for c in children[:10]]
+        lines.append(f"submodules: {', '.join(child_names)}")
 
     # Tags
     tags = {mod}
