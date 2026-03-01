@@ -16,7 +16,7 @@ AI navigation for codebases via `context.md` files. Instead of vector search —
 **Global** (all projects — recommended):
 
 ```bash
-claude mcp add --scope global ndoc -- uvx --from git+https://github.com/SMH-projects/neurodoc-mcp neurodoc-mcp
+claude mcp add --scope user ndoc -- uvx --from git+https://github.com/SMH-projects/neurodoc-mcp neurodoc-mcp
 ```
 
 **Per project** (current project only):
