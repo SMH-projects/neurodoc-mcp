@@ -96,16 +96,21 @@ def parse_js_ts(filepath: Path) -> dict:
         return {'functions': [], 'imports': []}
 
     functions, imports = [], []
+    seen = set()
     patterns = [
         r'(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)',
-        r'(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(([^)]*)\)\s*=>',
+        r'(?:export\s+)?const\s+(\w+)(?:\s*:[^=]+)?\s*=\s*(?:async\s+)?\(([^)]*)\)(?:\s*:[^=]*)?\s*=>',
         r'(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?function\s*\(([^)]*)\)',
     ]
     for pat in patterns:
         for m in re.finditer(pat, source):
+            name = m.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
             params = [p.strip().split(':')[0].split('=')[0].strip()
                       for p in m.group(2).split(',') if p.strip()][:4]
-            functions.append({'name': m.group(1), 'params': params})
+            functions.append({'name': name, 'params': params})
 
     for m in re.finditer(r"from\s+['\"]([^'\"]+)['\"]", source):
         imports.append(m.group(1))
