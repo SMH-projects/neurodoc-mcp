@@ -136,7 +136,7 @@ pip install neurodoc-mcp
 neurodoc-mcp
 
 # from source
-git clone https://github.com/YOUR_USERNAME/neurodoc-mcp
+git clone https://github.com/SMH-projects/neurodoc-mcp
 cd neurodoc-mcp
 bash install.sh
 ```

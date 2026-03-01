@@ -26,9 +26,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/neurodoc-mcp"
-Repository = "https://github.com/YOUR_USERNAME/neurodoc-mcp"
-Issues = "https://github.com/YOUR_USERNAME/neurodoc-mcp/issues"
+Homepage = "https://github.com/SMH-projects/neurodoc-mcp"
+Repository = "https://github.com/SMH-projects/neurodoc-mcp"
+Issues = "https://github.com/SMH-projects/neurodoc-mcp/issues"
 
 [project.scripts]
 neurodoc-mcp = "neurodoc_mcp.__main__:main"
