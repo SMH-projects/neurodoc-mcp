@@ -19,7 +19,7 @@ import subprocess
 import argparse
 import sys
 
-# ── Transport config ──────────────────────────────────────────────────────────
+# ── Transport config ───────────────────────────────────────────────────────────
 def _get_args():
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--transport", default=os.getenv("NDOC_TRANSPORT", "stdio"),
@@ -38,12 +38,9 @@ mcp = FastMCP(
     instructions="NeuroDoc — AI navigation for codebases via context.md files",
 )
 
-# WORKSPACE_ROOT: если задан, все пути резолвятся внутри него
-# Пример: WORKSPACE_ROOT=/workspace → ndoc_init("my-app") → /workspace/my-app
 WORKSPACE_ROOT = os.getenv("WORKSPACE_ROOT", "")
 
 def resolve_path(user_path: str = "") -> Path:
-    """Резолвит путь. Если пусто — берёт текущую директорию."""
     if not user_path or user_path.strip() == ".":
         base = Path(WORKSPACE_ROOT) if WORKSPACE_ROOT else Path.cwd()
         return base.resolve()
@@ -66,8 +63,81 @@ CODE_EXTENSIONS = {'.py', '.js', '.ts', '.jsx', '.tsx', '.go'}
 
 
 # ─────────────────────────────────────────────
-# PARSERS
+# BODY EXTRACTOR (brace counting)
 # ─────────────────────────────────────────────
+
+def extract_body(source: str, open_brace_pos: int) -> str:
+    """Extract content between matching braces, handling strings."""
+    depth = 1
+    i = open_brace_pos + 1
+    length = len(source)
+    while i < length and depth > 0:
+        c = source[i]
+        if c in ('"', "'", '`'):
+            i += 1
+            while i < length and source[i] != c:
+                if source[i] == '\\':
+                    i += 1
+                i += 1
+        elif c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        i += 1
+    return source[open_brace_pos:i]
+
+
+def find_func_body(source: str, after_pos: int) -> str:
+    """Find and extract function body (first { after position)."""
+    brace_pos = source.find('{', after_pos)
+    if brace_pos == -1:
+        return ''
+    return extract_body(source, brace_pos)
+
+
+# ─────────────────────────────────────────────
+# PYTHON PARSER (AST-based)
+# ─────────────────────────────────────────────
+
+def build_python_import_map(tree) -> dict:
+    """alias → short_module_name"""
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name.split('.')[0]
+                short = alias.name.split('.')[-1]
+                aliases[name] = short
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            mod_short = node.module.split('.')[-1]
+            for alias in node.names:
+                name = alias.asname or alias.name
+                aliases[name] = mod_short
+    return aliases
+
+
+def get_python_func_calls(func_node, import_map: dict) -> list:
+    """Extract external calls from a Python function node."""
+    calls, seen = [], set()
+    for child in ast.walk(func_node):
+        if isinstance(child, ast.Call):
+            if (isinstance(child.func, ast.Attribute)
+                    and isinstance(child.func.value, ast.Name)):
+                alias = child.func.value.id
+                if alias in import_map and alias not in ('self', 'cls'):
+                    key = f"{import_map[alias]}.{child.func.attr}"
+                    if key not in seen:
+                        seen.add(key)
+                        calls.append(key)
+            elif isinstance(child.func, ast.Name):
+                name = child.func.id
+                if name in import_map:
+                    key = import_map[name]
+                    if key not in seen:
+                        seen.add(key)
+                        calls.append(key)
+    return calls[:3]
+
 
 def parse_python(filepath: Path) -> dict:
     try:
@@ -76,17 +146,58 @@ def parse_python(filepath: Path) -> dict:
     except Exception:
         return {'functions': [], 'imports': []}
 
+    import_map = build_python_import_map(tree)
     functions, imports = [], []
+
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             params = [a.arg for a in node.args.args if a.arg != 'self'][:4]
-            functions.append({'name': node.name, 'params': params})
+            calls = get_python_func_calls(node, import_map)
+            functions.append({'name': node.name, 'params': params, 'calls': calls})
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 imports.append(alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imports.append(node.module)
+
     return {'functions': functions, 'imports': imports}
+
+
+# ─────────────────────────────────────────────
+# JS/TS PARSER
+# ─────────────────────────────────────────────
+
+def build_js_import_map(source: str) -> dict:
+    """Build name → module_short map from JS/TS imports."""
+    aliases = {}
+    # import { A, B as C } from 'module'
+    for m in re.finditer(r"import\s+\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]", source):
+        mod = m.group(2).split('/')[-1]
+        mod = re.sub(r'\.(ts|tsx|js|jsx)$', '', mod)
+        for part in m.group(1).split(','):
+            part = part.strip()
+            if ' as ' in part:
+                _, alias = part.split(' as ', 1)
+                aliases[alias.strip()] = mod
+            elif part:
+                aliases[part] = mod
+    # import Default from 'module'
+    for m in re.finditer(r"import\s+(\w+)\s+from\s+['\"]([^'\"]+)['\"]", source):
+        mod = m.group(2).split('/')[-1]
+        mod = re.sub(r'\.(ts|tsx|js|jsx)$', '', mod)
+        aliases[m.group(1)] = mod
+    return aliases
+
+
+def get_js_calls_in_body(body: str, import_map: dict) -> list:
+    """Find which imported names are used in a function body."""
+    calls, seen = [], set()
+    for name, mod in import_map.items():
+        if re.search(rf'\b{re.escape(name)}\s*[\.(]', body):
+            if mod not in seen:
+                seen.add(mod)
+                calls.append(mod)
+    return calls[:3]
 
 
 def parse_js_ts(filepath: Path) -> dict:
@@ -95,26 +206,63 @@ def parse_js_ts(filepath: Path) -> dict:
     except Exception:
         return {'functions': [], 'imports': []}
 
+    import_map = build_js_import_map(source)
     functions, imports = [], []
-    seen = set()
+    seen_names = set()
+
     patterns = [
         r'(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)',
         r'(?:export\s+)?const\s+(\w+)(?:\s*:[^=]+)?\s*=\s*(?:async\s+)?\(([^)]*)\)(?:\s*:[^=]*)?\s*=>',
         r'(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?function\s*\(([^)]*)\)',
     ]
+
     for pat in patterns:
         for m in re.finditer(pat, source):
             name = m.group(1)
-            if name in seen:
+            if name in seen_names:
                 continue
-            seen.add(name)
+            seen_names.add(name)
             params = [p.strip().split(':')[0].split('=')[0].strip()
                       for p in m.group(2).split(',') if p.strip()][:4]
-            functions.append({'name': name, 'params': params})
+            body = find_func_body(source, m.end())
+            calls = get_js_calls_in_body(body, import_map) if body else []
+            functions.append({'name': name, 'params': params, 'calls': calls})
 
     for m in re.finditer(r"from\s+['\"]([^'\"]+)['\"]", source):
         imports.append(m.group(1))
+
     return {'functions': functions, 'imports': imports}
+
+
+# ─────────────────────────────────────────────
+# GO PARSER
+# ─────────────────────────────────────────────
+
+def build_go_import_map(source: str) -> dict:
+    """Build pkg_alias → short_name map from Go imports."""
+    aliases = {}
+    in_block = False
+    for line in source.split('\n'):
+        line = line.strip()
+        if line.startswith('import ('):
+            in_block = True
+            continue
+        if in_block:
+            if line == ')':
+                in_block = False
+            else:
+                m = re.search(r'"([^"]+)"', line)
+                if m:
+                    pkg = m.group(1).split('/')[-1]
+                    alias_m = re.match(r'^(\w+)\s+"', line)
+                    alias = alias_m.group(1) if alias_m else pkg
+                    aliases[alias] = pkg
+        elif re.match(r'^import\s+"', line):
+            m = re.search(r'"([^"]+)"', line)
+            if m:
+                pkg = m.group(1).split('/')[-1]
+                aliases[pkg] = pkg
+    return aliases
 
 
 def parse_go(filepath: Path) -> dict:
@@ -123,31 +271,31 @@ def parse_go(filepath: Path) -> dict:
     except Exception:
         return {'functions': [], 'imports': []}
 
-    functions, imports = [], []
-    for m in re.finditer(r'func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(([^)]*)\)', source):
-        params = [p.strip() for p in m.group(2).split(',') if p.strip()][:4]
-        functions.append({'name': m.group(1), 'params': params})
+    import_map = build_go_import_map(source)
+    functions = []
 
-    in_import_block = False
-    for line in source.split('\n'):
-        line = line.strip()
-        if line.startswith('import ('):
-            in_import_block = True
-            continue
-        if in_import_block:
-            if line == ')':
-                in_import_block = False
-            else:
-                m = re.search(r'"([^"]+)"', line)
-                if m:
-                    imports.append(m.group(1).split('/')[-1])
-        elif line.startswith('import "'):
-            m = re.search(r'"([^"]+)"', line)
-            if m:
-                imports.append(m.group(1).split('/')[-1])
+    for m in re.finditer(
+        r'func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(([^)]*)\)', source
+    ):
+        name = m.group(1)
+        raw_params = [p.strip() for p in m.group(2).split(',') if p.strip()]
+        params = [p.split()[-1].lstrip('*').split('.')[0] for p in raw_params][:4]
+        body = find_func_body(source, m.end())
+        calls, seen = [], set()
+        for pkg, short in import_map.items():
+            if body and re.search(rf'\b{re.escape(pkg)}\.', body):
+                if short not in seen:
+                    seen.add(short)
+                    calls.append(short)
+        functions.append({'name': name, 'params': params, 'calls': calls[:3]})
 
+    imports = list(import_map.values())
     return {'functions': functions, 'imports': imports}
 
+
+# ─────────────────────────────────────────────
+# DISPATCH
+# ─────────────────────────────────────────────
 
 def parse_file(filepath: Path) -> dict:
     ext = filepath.suffix.lower()
@@ -161,13 +309,15 @@ def parse_file(filepath: Path) -> dict:
 
 
 def scan_dir(dir_path: Path) -> dict:
-    """Scan directory, return {filename: parsed_data} for files with functions."""
     result = {}
-    for f in dir_path.iterdir():
-        if f.is_file() and f.suffix.lower() in CODE_EXTENSIONS:
-            parsed = parse_file(f)
-            if parsed['functions']:
-                result[f.name] = parsed
+    try:
+        for f in dir_path.iterdir():
+            if f.is_file() and f.suffix.lower() in CODE_EXTENSIONS:
+                parsed = parse_file(f)
+                if parsed['functions']:
+                    result[f.name] = parsed
+    except PermissionError:
+        pass
     return result
 
 
@@ -184,10 +334,9 @@ def short_name(dir_path: Path, root: Path) -> str:
 def resolve_deps(imports: list, all_modules: list) -> list:
     deps = []
     for imp in imports:
-        imp_lower = imp.lower().replace('-', '_').replace('/', '_')
+        imp_norm = imp.lower().replace('-', '_').replace('/', '_')
         for mod in all_modules:
-            mod_lower = mod.lower()
-            if mod_lower in imp_lower or imp_lower == mod_lower:
+            if mod.lower() in imp_norm or imp_norm == mod.lower():
                 if mod not in deps:
                     deps.append(mod)
     return deps
@@ -200,40 +349,84 @@ def safe_rel(path: Path, root: Path) -> str:
         return path.name
 
 
+def child_subdirs_with_code(dir_path: Path) -> list:
+    """Return immediate subdirs that contain code files."""
+    result = []
+    try:
+        for item in sorted(dir_path.iterdir()):
+            if item.is_dir() and item.name not in SKIP_DIRS:
+                has_code = any(
+                    f.suffix.lower() in CODE_EXTENSIONS
+                    for f in item.rglob('*') if f.is_file()
+                )
+                if has_code:
+                    result.append(item)
+    except PermissionError:
+        pass
+    return result
+
+
 # ─────────────────────────────────────────────
-# GENERATORS
+# CONTEXT.MD GENERATORS
 # ─────────────────────────────────────────────
 
 def make_context_md(dir_path: Path, root: Path, all_modules: list) -> str:
     files_data = scan_dir(dir_path)
     mod = short_name(dir_path, root)
 
+    # Parent directory: no direct code but has subdirs with code
+    if not files_data:
+        children = child_subdirs_with_code(dir_path)
+        if children:
+            child_names = [c.name for c in children[:12]]
+            lines = [
+                f"# {mod}",
+                f"submodules: {', '.join(child_names)}",
+                f"tags: {mod} {' '.join(child_names[:8])}",
+                f"upd: {datetime.now().strftime('%Y-%m-%d')} ndoc",
+            ]
+            return '\n'.join(lines)
+        # truly empty
+        return f"# {mod}\ntags: {mod}\nupd: {datetime.now().strftime('%Y-%m-%d')} ndoc"
+
+    # Collect imports → compute module deps
     all_imports = []
     for fd in files_data.values():
         all_imports.extend(fd.get('imports', []))
-
     deps = resolve_deps(all_imports, [m for m in all_modules if m != mod])
 
+    # Header: # module → dep1, dep2
     header = f"# {mod}"
     if deps:
-        header += f" | {', '.join(deps[:5])}"
+        header += f" → {', '.join(deps[:5])}"
 
     lines = [header]
+
+    # File lines with function call tracking
     for fname, fd in files_data.items():
         funcs = fd.get('functions', [])[:8]
-        if funcs:
-            parts = []
-            for fn in funcs:
-                p = ','.join(fn['params'][:3])
-                parts.append(f"{fn['name']}({p})")
-            lines.append(f"{fname}: {' | '.join(parts)}")
+        if not funcs:
+            continue
+        parts = []
+        for fn in funcs:
+            p = ','.join(fn['params'][:3])
+            entry = f"{fn['name']}({p})"
+            calls = fn.get('calls', [])
+            if calls:
+                entry += f"→{','.join(calls[:2])}"
+            parts.append(entry)
+        lines.append(f"{fname}: {' | '.join(parts)}")
 
+    # Tags
     tags = {mod}
     for d in deps:
         tags.add(d)
     for fname in files_data:
         base = re.sub(r'\.(py|go|ts|js|tsx|jsx)$', '', fname)
         tags.add(base)
+    for fd in files_data.values():
+        for fn in fd.get('functions', [])[:2]:
+            tags.add(fn['name'].lower())
 
     lines.append(f"tags: {' '.join(list(tags)[:12])}")
     lines.append(f"upd: {datetime.now().strftime('%Y-%m-%d')} ndoc")
@@ -242,33 +435,53 @@ def make_context_md(dir_path: Path, root: Path, all_modules: list) -> str:
 
 def make_index(modules: dict, project_name: str) -> str:
     now = datetime.now().strftime('%Y-%m-%d')
+
     lines = [
         f"# Project: {project_name} | modules: {len(modules)} | updated: {now}",
         "",
         "## Map",
     ]
+
     for mod, data in modules.items():
         deps = data.get('deps', [])
         kw = data.get('keywords', [])[:4]
         dep_str = ', '.join(deps) if deps else '(none)'
-        kw_str = ', '.join(kw)
-        lines.append(f"{mod} → {dep_str} | {kw_str}")
+        line = f"{mod} → {dep_str}"
+        if kw:
+            line += f" | {', '.join(kw)}"
+        lines.append(line)
 
-    lines += ["", "## Dependency Graph", "", "```mermaid", "graph TD"]
+    # Build graph chains
+    dep_graph = {mod: data.get('deps', []) for mod, data in modules.items()}
+    all_deps_flat = {d for deps in dep_graph.values() for d in deps}
+    entry_points = [m for m in modules if m not in all_deps_flat]
+
+    lines += ["", "## Graph"]
+    seen_chains = set()
+    for entry in (entry_points or list(modules.keys()))[:6]:
+        chain = [entry]
+        current = entry
+        for _ in range(6):
+            deps = dep_graph.get(current, [])
+            if not deps:
+                break
+            nxt = next((d for d in deps if d in modules and d not in chain), None)
+            if not nxt:
+                break
+            chain.append(nxt)
+            current = nxt
+        if len(chain) > 1:
+            chain_str = ' → '.join(chain)
+            if chain_str not in seen_chains:
+                seen_chains.add(chain_str)
+                lines.append(chain_str)
+
+    # Mermaid graph
+    lines += ["", "## Mermaid", "", "```mermaid", "graph TD"]
     for mod, data in modules.items():
         for dep in data.get('deps', []):
             if dep in modules:
                 lines.append(f"    {mod} --> {dep}")
-    lines.append("```")
-
-    lines += ["", "## C4 Component Diagram", "", "```mermaid", "C4Component"]
-    lines.append(f'    title Component diagram for {project_name}')
-    for mod in modules:
-        lines.append(f'    Component({mod}, "{mod}", "module")')
-    for mod, data in modules.items():
-        for dep in data.get('deps', []):
-            if dep in modules:
-                lines.append(f'    Rel({mod}, {dep}, "uses")')
     lines.append("```")
 
     return '\n'.join(lines)
@@ -291,8 +504,8 @@ CLAUDE_MD_RULES = """
 
 ### Формат context.md:
 ```
-# module_name | dep1, dep2
-file.ext: FuncA(params) | FuncB(params)
+# module_name → dep1, dep2
+file.ext: FuncA(params)→dep.call | FuncB(params)
 tags: keyword1 keyword2
 upd: YYYY-MM-DD author
 ```
@@ -307,24 +520,18 @@ upd: YYYY-MM-DD author
 def ndoc_init(project_path: str = "") -> str:
     """
     Инициализирует NeuroDoc для проекта.
-    Создаёт context.md в каждой папке с кодом, context.index.md с C4 диаграммой,
+    Создаёт context.md в каждой папке с кодом, context.index.md с картой зависимостей,
     и добавляет правила в CLAUDE.md.
 
     project_path: путь к проекту. Если не указан — использует текущую директорию.
-    Примеры:
-      ndoc_init()                          # текущая папка
-      ndoc_init(".")                       # текущая папка
-      ndoc_init("/workspace/my-project")   # конкретный путь
     """
     root = resolve_path(project_path)
     if not root.exists():
         return f"❌ Папка не найдена: {project_path}"
 
-    out = []
-    out.append(f"🚀 NeuroDoc Init — {root.name}")
-    out.append("━" * 48)
+    out = [f"🚀 NeuroDoc Init — {root.name}", "━" * 48]
 
-    # ── Шаг 1: Сканирование ──────────────────────────
+    # Сканирование
     out.append("\n📂 Шаг 1/5 — Сканирование проекта...")
     dirs_with_code = []
     for dp, subdirs, files in os.walk(root):
@@ -333,14 +540,23 @@ def ndoc_init(project_path: str = "") -> str:
         if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files):
             dirs_with_code.append(dp)
 
-    out.append(f"   ✓ Найдено папок с кодом: {len(dirs_with_code)}")
+    # Also include parent dirs that have subdirs with code
+    all_dirs = set(dirs_with_code)
+    for dp in dirs_with_code:
+        parent = dp.parent
+        while parent != root.parent and parent != root:
+            all_dirs.add(parent)
+            parent = parent.parent
+    all_dirs.add(root)
 
-    # ── Шаг 2: Парсинг ───────────────────────────────
+    out.append(f"   ✓ Найдено директорий: {len(all_dirs)}")
+
+    # Парсинг
     out.append("\n🔍 Шаг 2/5 — Парсинг файлов...")
-    all_module_names = [short_name(d, root) for d in dirs_with_code]
+    all_module_names = [short_name(d, root) for d in all_dirs]
     modules: dict = {}
 
-    for dp in dirs_with_code:
+    for dp in sorted(all_dirs):
         mod = short_name(dp, root)
         files_data = scan_dir(dp)
         all_imports, keywords = [], []
@@ -357,31 +573,29 @@ def ndoc_init(project_path: str = "") -> str:
             'deps': deps,
             'keywords': keywords[:4],
         }
-        out.append(f"   ✓ {safe_rel(dp, root) or root.name}/ — "
-                   f"{len(files_data)} файлов, {func_count} функций")
+        if files_data:
+            out.append(f"   ✓ {safe_rel(dp, root) or root.name}/ — "
+                       f"{len(files_data)} файлов, {func_count} функций")
 
-    # ── Шаг 3: context.md ────────────────────────────
+    # context.md
     out.append(f"\n📝 Шаг 3/5 — Генерация context.md...")
     generated = 0
     for mod, data in modules.items():
         dp = data['dir_path']
         content = make_context_md(dp, root, all_module_names)
         (dp / 'context.md').write_text(content, encoding='utf-8')
-        rel = safe_rel(dp, root) or root.name
-        out.append(f"   ✓ {rel}/context.md")
         generated += 1
 
     out.append(f"   → Создано: {generated} файлов")
 
-    # ── Шаг 4: context.index.md + C4 ─────────────────
-    out.append(f"\n🗺️  Шаг 4/5 — context.index.md + C4 диаграмма...")
+    # context.index.md
+    out.append(f"\n🗺️  Шаг 4/5 — context.index.md...")
     index_content = make_index(modules, root.name)
     (root / 'context.index.md').write_text(index_content, encoding='utf-8')
     out.append(f"   ✓ context.index.md — {len(modules)} модулей")
-    out.append(f"   ✓ Dependency Graph (Mermaid)")
-    out.append(f"   ✓ C4 Component Diagram (Mermaid)")
+    out.append(f"   ✓ Map + Graph + Mermaid диаграмма")
 
-    # ── Шаг 5: CLAUDE.md ─────────────────────────────
+    # CLAUDE.md
     out.append(f"\n⚙️  Шаг 5/5 — Обновление CLAUDE.md...")
     claude_path = root / 'CLAUDE.md'
     if claude_path.exists():
@@ -395,17 +609,17 @@ def ndoc_init(project_path: str = "") -> str:
         claude_path.write_text(f"# {root.name}\n{CLAUDE_MD_RULES}", encoding='utf-8')
         out.append("   ✓ CLAUDE.md создан с правилами NeuroDoc")
 
-    # ── Итог ─────────────────────────────────────────
-    out.append("")
-    out.append("━" * 48)
-    out.append(f"✅ NeuroDoc инициализирован успешно!")
-    out.append(f"")
-    out.append(f"   📁 {generated} context.md файлов создано")
-    out.append(f"   🗺️  context.index.md с C4 диаграммой")
-    out.append(f"   ⚙️  CLAUDE.md обновлён")
-    out.append(f"")
-    out.append(f"💡 Теперь Claude будет читать context.md перед каждой задачей.")
-    out.append(f"   Запусти ndoc_validate для проверки актуальности.")
+    out += [
+        "",
+        "━" * 48,
+        "✅ NeuroDoc инициализирован!",
+        "",
+        f"   📁 {generated} context.md файлов",
+        f"   🗺️  context.index.md с Map + Graph",
+        f"   ⚙️  CLAUDE.md обновлён",
+        "",
+        "💡 Запусти ndoc_validate для проверки актуальности.",
+    ]
     return '\n'.join(out)
 
 
@@ -421,11 +635,8 @@ def ndoc_update(project_path: str = "", changed_files: str = "") -> str:
     if not root.exists():
         return f"❌ Папка не найдена: {project_path}"
 
-    out = []
-    out.append("🔄 NeuroDoc Update")
-    out.append("━" * 40)
+    out = ["🔄 NeuroDoc Update", "━" * 40]
 
-    # Определяем папки для обновления
     if changed_files.strip():
         files = [root / f.strip() for f in changed_files.split(',')]
         dirs_to_update = list({f.parent for f in files if f.exists()})
@@ -449,12 +660,11 @@ def ndoc_update(project_path: str = "", changed_files: str = "") -> str:
                 dp = Path(dp)
                 if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files_in_dir):
                     dirs_to_update.append(dp)
-            out.append(f"\n   Git diff не найден — обновляем все {len(dirs_to_update)} модулей")
+            out.append(f"\n   Обновляем все {len(dirs_to_update)} модулей")
 
     if not dirs_to_update:
         return "ℹ️  Нечего обновлять"
 
-    # Собираем все имена модулей
     all_module_names = []
     for dp, subdirs, _ in os.walk(root):
         subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
@@ -465,11 +675,10 @@ def ndoc_update(project_path: str = "", changed_files: str = "") -> str:
     for dp in dirs_to_update:
         content = make_context_md(dp, root, all_module_names)
         (dp / 'context.md').write_text(content, encoding='utf-8')
-        rel = safe_rel(dp, root) or root.name
-        out.append(f"   ✓ {rel}/context.md")
+        out.append(f"   ✓ {safe_rel(dp, root) or root.name}/context.md")
         updated += 1
 
-    # Пересобираем индекс
+    # Rebuild index
     modules: dict = {}
     for dp, subdirs, files_in_dir in os.walk(root):
         subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
@@ -484,9 +693,7 @@ def ndoc_update(project_path: str = "", changed_files: str = "") -> str:
             deps = resolve_deps(all_imp, [m for m in all_module_names if m != mod])
             modules[mod] = {'dir_path': dp, 'files': fd_map, 'deps': deps, 'keywords': kw[:4]}
 
-    index_content = make_index(modules, root.name)
-    (root / 'context.index.md').write_text(index_content, encoding='utf-8')
-
+    (root / 'context.index.md').write_text(make_index(modules, root.name), encoding='utf-8')
     out.append(f"\n   ✓ context.index.md обновлён")
     out.append(f"\n✅ Обновлено {updated} context.md файлов")
     return '\n'.join(out)
@@ -502,10 +709,7 @@ def ndoc_validate(project_path: str = "") -> str:
     if not root.exists():
         return f"❌ Папка не найдена: {project_path}"
 
-    out = []
-    out.append("🔍 NeuroDoc Validate")
-    out.append("━" * 40)
-
+    out = ["🔍 NeuroDoc Validate", "━" * 40, ""]
     fresh, stale, missing = [], [], []
 
     for dp, subdirs, files in os.walk(root):
@@ -530,18 +734,15 @@ def ndoc_validate(project_path: str = "") -> str:
             fresh.append(rel)
 
     total = len(fresh) + len(stale) + len(missing)
-    out.append("")
 
     if fresh:
         out.append(f"✅ Актуальные ({len(fresh)}):")
         for m in fresh:
             out.append(f"   ✓ {m}/")
-
     if stale:
-        out.append(f"\n⚠️  Устаревшие ({len(stale)}) — код изменён после context.md:")
+        out.append(f"\n⚠️  Устаревшие ({len(stale)}):")
         for m in stale:
             out.append(f"   ⚠ {m}/")
-
     if missing:
         out.append(f"\n❌ Нет context.md ({len(missing)}):")
         for m in missing:
@@ -555,8 +756,7 @@ def ndoc_validate(project_path: str = "") -> str:
         bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
         out.append(f"📊 [{bar}] {pct}% актуально")
         out.append(f"   {len(fresh)}/{total} свежих · {len(stale)} устаревших · {len(missing)} отсутствуют")
-        out.append("")
-        out.append("💡 Запусти ndoc_update для обновления")
+        out.append("\n💡 Запусти ndoc_update для обновления")
 
     return '\n'.join(out)
 
@@ -571,9 +771,7 @@ def ndoc_status(project_path: str = "") -> str:
     if not root.exists():
         return f"❌ Папка не найдена: {project_path}"
 
-    out = []
-    out.append(f"📊 NeuroDoc Status — {root.name}")
-    out.append("━" * 40)
+    out = [f"📊 NeuroDoc Status — {root.name}", "━" * 40]
 
     index_path = root / 'context.index.md'
     ctx_count = sum(
@@ -591,9 +789,7 @@ def ndoc_status(project_path: str = "") -> str:
     if index_path.exists():
         out.append("\n─── context.index.md ───────────────────")
         lines = index_path.read_text(encoding='utf-8').split('\n')
-        # Show Map section (skip mermaid blocks for brevity)
-        in_mermaid = False
-        shown = 0
+        in_mermaid, shown = False, 0
         for line in lines:
             if '```mermaid' in line:
                 in_mermaid = True
@@ -601,10 +797,10 @@ def ndoc_status(project_path: str = "") -> str:
             if in_mermaid and '```' in line:
                 in_mermaid = False
                 continue
-            if not in_mermaid and shown < 25:
+            if not in_mermaid and shown < 30:
                 out.append(f"  {line}")
                 shown += 1
-        if shown >= 25:
+        if shown >= 30:
             out.append("  ...")
     else:
         out.append("\n💡 Запусти ndoc_init для инициализации")
