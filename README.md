@@ -162,6 +162,22 @@ claude mcp add ndoc --transport http http://localhost:8000/mcp
 
 ---
 
+## Updating
+
+To get the latest version:
+
+```bash
+uv cache clean neurodoc-mcp
+```
+
+Or force refresh without clearing the full cache:
+
+```bash
+uvx --from git+https://github.com/SMH-projects/neurodoc-mcp neurodoc-mcp --refresh
+```
+
+---
+
 ## License
 
 MIT
