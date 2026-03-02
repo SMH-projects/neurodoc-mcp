@@ -370,9 +370,10 @@ def child_subdirs_with_code(dir_path: Path) -> list:
 # CONTEXT.MD GENERATORS
 # ─────────────────────────────────────────────
 
-def make_context_md(dir_path: Path, root: Path, all_modules: list) -> str:
+def make_context_md(dir_path: Path, root: Path, all_modules: list, reverse_deps: dict = None) -> str:
     files_data = scan_dir(dir_path)
     mod = short_name(dir_path, root)
+    now = datetime.now().strftime('%Y-%m-%d')
 
     # Check for subdirs with code (always, not only when files_data is empty)
     children = child_subdirs_with_code(dir_path)
@@ -380,15 +381,28 @@ def make_context_md(dir_path: Path, root: Path, all_modules: list) -> str:
     # Pure parent directory: no direct code files
     if not files_data:
         if children:
-            child_names = [c.name for c in children[:12]]
-            lines = [
-                f"# {mod}",
-                f"submodules: {', '.join(child_names)}",
-                f"tags: {mod} {' '.join(child_names[:8])}",
-                f"upd: {datetime.now().strftime('%Y-%m-%d')} ndoc",
+            child_names = [c.name for c in children]
+            lines = [f"# {mod}", ""]
+            lines.append(f"**submodules:** {', '.join(child_names)}")
+            # Show what each child does if we can infer
+            for child in children[:8]:
+                child_data = scan_dir(child)
+                if child_data:
+                    child_funcs = []
+                    for fd in child_data.values():
+                        for fn in fd.get('functions', [])[:2]:
+                            child_funcs.append(fn['name'])
+                    if child_funcs:
+                        lines.append(f"- **{child.name}**: {', '.join(child_funcs[:4])}")
+                    else:
+                        lines.append(f"- **{child.name}**")
+            lines += [
+                "",
+                f"**tags:** {mod} {' '.join(child_names[:8])}",
+                f"**updated:** {now} ndoc",
             ]
             return '\n'.join(lines)
-        return f"# {mod}\ntags: {mod}\nupd: {datetime.now().strftime('%Y-%m-%d')} ndoc"
+        return f"# {mod}\n\n**tags:** {mod}\n**updated:** {now} ndoc"
 
     # Collect imports → compute module deps
     all_imports = []
@@ -396,32 +410,43 @@ def make_context_md(dir_path: Path, root: Path, all_modules: list) -> str:
         all_imports.extend(fd.get('imports', []))
     deps = resolve_deps(all_imports, [m for m in all_modules if m != mod])
 
+    # Reverse deps: who uses this module
+    used_by = []
+    if reverse_deps:
+        used_by = reverse_deps.get(mod, [])
+
     # Header: # module → dep1, dep2
     header = f"# {mod}"
     if deps:
-        header += f" → {', '.join(deps[:5])}"
+        header += f" → {', '.join(deps)}"
 
-    lines = [header]
+    lines = [header, ""]
 
-    # File lines with function call tracking
+    if used_by:
+        lines.append(f"**used by:** {', '.join(used_by)}")
+        lines.append("")
+
+    # Per-file detailed sections
     for fname, fd in files_data.items():
-        funcs = fd.get('functions', [])[:8]
+        funcs = fd.get('functions', [])
         if not funcs:
             continue
-        parts = []
+
+        lines.append(f"## {fname}")
         for fn in funcs:
-            p = ','.join(fn['params'][:3])
-            entry = f"{fn['name']}({p})"
+            params = ', '.join(fn['params'])
+            entry = f"`{fn['name']}({params})`"
             calls = fn.get('calls', [])
             if calls:
-                entry += f"→{','.join(calls[:2])}"
-            parts.append(entry)
-        lines.append(f"{fname}: {' | '.join(parts)}")
+                entry += f" → {', '.join(calls)}"
+            lines.append(f"- {entry}")
+        lines.append("")
 
-    # Add submodules line if has child dirs with code
+    # Submodules section
     if children:
-        child_names = [c.name for c in children[:10]]
-        lines.append(f"submodules: {', '.join(child_names)}")
+        child_names = [c.name for c in children]
+        lines.append(f"**submodules:** {', '.join(child_names)}")
+        lines.append("")
 
     # Tags
     tags = {mod}
@@ -431,11 +456,11 @@ def make_context_md(dir_path: Path, root: Path, all_modules: list) -> str:
         base = re.sub(r'\.(py|go|ts|js|tsx|jsx)$', '', fname)
         tags.add(base)
     for fd in files_data.values():
-        for fn in fd.get('functions', [])[:2]:
+        for fn in fd.get('functions', [])[:3]:
             tags.add(fn['name'].lower())
 
-    lines.append(f"tags: {' '.join(list(tags)[:12])}")
-    lines.append(f"upd: {datetime.now().strftime('%Y-%m-%d')} ndoc")
+    lines.append(f"**tags:** {' '.join(sorted(tags)[:16])}")
+    lines.append(f"**updated:** {now} ndoc")
     return '\n'.join(lines)
 
 
@@ -504,16 +529,23 @@ CLAUDE_MD_RULES = """
 5. Только потом приступай
 
 ### ПОСЛЕ каждого изменения кода:
-1. Обнови `context.md` в изменённой директории
+1. Обнови `context.md` в изменённой директории (запусти ndoc_update)
 2. Обнови `context.index.md` если добавился новый модуль или изменились связи
-3. Формат: компактный (не более 120 токенов на файл)
 
 ### Формат context.md:
-```
+```markdown
 # module_name → dep1, dep2
-file.ext: FuncA(params)→dep.call | FuncB(params)
-tags: keyword1 keyword2
-upd: YYYY-MM-DD author
+
+**used by:** parent_module, other_module
+
+## filename.go
+- `FuncA(param1, param2)` → dep1, dep2
+- `FuncB()`
+
+**submodules:** child1, child2
+
+**tags:** keyword1 keyword2
+**updated:** YYYY-MM-DD ndoc
 ```
 """
 
@@ -583,12 +615,18 @@ def ndoc_init(project_path: str = "") -> str:
             out.append(f"   ✓ {safe_rel(dp, root) or root.name}/ — "
                        f"{len(files_data)} файлов, {func_count} функций")
 
+    # Build reverse dependency map: mod → [list of modules that depend on it]
+    reverse_deps: dict = {}
+    for mod, data in modules.items():
+        for dep in data.get('deps', []):
+            reverse_deps.setdefault(dep, []).append(mod)
+
     # context.md
     out.append(f"\n📝 Шаг 3/5 — Генерация context.md...")
     generated = 0
     for mod, data in modules.items():
         dp = data['dir_path']
-        content = make_context_md(dp, root, all_module_names)
+        content = make_context_md(dp, root, all_module_names, reverse_deps)
         (dp / 'context.md').write_text(content, encoding='utf-8')
         generated += 1
 
@@ -684,7 +722,7 @@ def ndoc_update(project_path: str = "", changed_files: str = "") -> str:
         out.append(f"   ✓ {safe_rel(dp, root) or root.name}/context.md")
         updated += 1
 
-    # Rebuild index
+    # Rebuild index and reverse deps
     modules: dict = {}
     for dp, subdirs, files_in_dir in os.walk(root):
         subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
@@ -698,6 +736,16 @@ def ndoc_update(project_path: str = "", changed_files: str = "") -> str:
                 kw.extend([fn['name'] for fn in fd.get('functions', [])[:2]])
             deps = resolve_deps(all_imp, [m for m in all_module_names if m != mod])
             modules[mod] = {'dir_path': dp, 'files': fd_map, 'deps': deps, 'keywords': kw[:4]}
+
+    reverse_deps: dict = {}
+    for mod, data in modules.items():
+        for dep in data.get('deps', []):
+            reverse_deps.setdefault(dep, []).append(mod)
+
+    # Re-generate context.md for updated dirs with reverse_deps
+    for dp in dirs_to_update:
+        content = make_context_md(dp, root, all_module_names, reverse_deps)
+        (dp / 'context.md').write_text(content, encoding='utf-8')
 
     (root / 'context.index.md').write_text(make_index(modules, root.name), encoding='utf-8')
     out.append(f"\n   ✓ context.index.md обновлён")
