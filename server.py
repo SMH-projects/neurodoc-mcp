@@ -405,11 +405,28 @@ def module_container_type(mod_name: str) -> str:
 
 
 _STDLIB_NOISE = {
-    'os', 'sys', 'fmt', 'io', 'http', 'log', 'err', 'ctx', 'pkg',
-    'time', 'math', 'path', 'net', 'url', 'strings', 'strconv',
+    # Go stdlib
+    'os', 'fmt', 'io', 'http', 'log', 'err', 'ctx', 'pkg',
+    'time', 'math', 'net', 'url', 'strings', 'strconv',
     'bytes', 'errors', 'sync', 'context', 'runtime', 'reflect',
     'encoding', 'unicode', 'sort', 'bufio', 'regexp', 'json',
-    'atomic', 'maps', 'slices', 'testing', 'main',
+    'atomic', 'maps', 'slices', 'testing', 'main', 'flag',
+    'filepath', 'crypto', 'hash', 'binary', 'hex', 'base64',
+    # Python stdlib
+    'sys', 'os', 'pathlib', 'datetime', 're', 'ast', 'subprocess',
+    'argparse', 'typing', 'collections', 'itertools', 'functools',
+    'abc', 'copy', 'dataclasses', 'enum', 'inspect', 'logging',
+    'threading', 'multiprocessing', 'asyncio', 'socket', 'ssl',
+    'json', 'csv', 'xml', 'html', 'urllib', 'http', 'email',
+    'hashlib', 'hmac', 'secrets', 'random', 'math', 'statistics',
+    'struct', 'io', 'tempfile', 'shutil', 'glob', 'fnmatch',
+    'traceback', 'warnings', 'weakref', 'gc', 'platform', 'signal',
+    'unittest', 'pytest', 'pprint', 'string', 'textwrap', 'difflib',
+    # Node/JS built-ins
+    'path', 'fs', 'url', 'http', 'https', 'crypto', 'stream',
+    'events', 'util', 'buffer', 'child_process', 'cluster', 'net',
+    'dns', 'tls', 'zlib', 'readline', 'repl', 'vm', 'module',
+    'process', 'console', 'timers', 'perf_hooks',
 }
 
 
