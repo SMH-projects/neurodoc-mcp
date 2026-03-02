@@ -367,6 +367,199 @@ def child_subdirs_with_code(dir_path: Path) -> list:
 
 
 # ─────────────────────────────────────────────
+# C4 DIAGRAM HELPERS
+# ─────────────────────────────────────────────
+
+def detect_tech(files_data: dict) -> str:
+    ext_counts: dict = {}
+    for fname in files_data:
+        ext = Path(fname).suffix.lower()
+        ext_counts[ext] = ext_counts.get(ext, 0) + 1
+    if not ext_counts:
+        return "Code"
+    primary = max(ext_counts, key=ext_counts.get)
+    return {
+        '.py': 'Python', '.go': 'Go',
+        '.ts': 'TypeScript', '.tsx': 'TypeScript/React',
+        '.js': 'JavaScript', '.jsx': 'JavaScript/React',
+        '.rb': 'Ruby', '.java': 'Java', '.rs': 'Rust',
+        '.cs': 'C#', '.cpp': 'C++', '.kt': 'Kotlin', '.swift': 'Swift',
+    }.get(primary, primary.lstrip('.').upper() or 'Code')
+
+
+def c4_alias(name: str) -> str:
+    return re.sub(r'[^a-zA-Z0-9]', '_', name).strip('_') or 'mod'
+
+
+def c4_label(s: str) -> str:
+    return s.replace('"', "'")[:60]
+
+
+def module_container_type(mod_name: str) -> str:
+    name = mod_name.lower().split('/')[-1]
+    if re.search(r'\b(db|database|store|storage|repo|repository|dao|model|models|migration|schema|cache|redis|mongo)\b', name):
+        return 'ContainerDb'
+    if re.search(r'\b(queue|worker|broker|kafka|celery|task|tasks|job|jobs|consumer|producer|amqp)\b', name):
+        return 'ContainerQueue'
+    return 'Container'
+
+
+_STDLIB_NOISE = {
+    'os', 'sys', 'fmt', 'io', 'http', 'log', 'err', 'ctx', 'pkg',
+    'time', 'math', 'path', 'net', 'url', 'strings', 'strconv',
+    'bytes', 'errors', 'sync', 'context', 'runtime', 'reflect',
+    'encoding', 'unicode', 'sort', 'bufio', 'regexp', 'json',
+    'atomic', 'maps', 'slices', 'testing', 'main',
+}
+
+
+def collect_external_deps(modules: dict, all_module_names: list) -> list:
+    """Return top external deps sorted by usage frequency."""
+    mod_set = {m.lower() for m in all_module_names}
+    mod_leaves = {m.lower().split('/')[-1] for m in all_module_names}
+    counts: dict = {}
+    for mod, data in modules.items():
+        seen = set()
+        for fd in data.get('files', {}).values():
+            for imp in fd.get('imports', []):
+                if imp.startswith('.') or imp.startswith('/'):
+                    continue
+                root_pkg = re.sub(r'[^a-z0-9_-]', '', imp.split('/')[0].split('.')[0].lower())
+                if not root_pkg or len(root_pkg) < 2:
+                    continue
+                if root_pkg in mod_set or root_pkg in mod_leaves:
+                    continue
+                if root_pkg in _STDLIB_NOISE:
+                    continue
+                if root_pkg not in seen:
+                    seen.add(root_pkg)
+                    counts[root_pkg] = counts.get(root_pkg, 0) + 1
+    return sorted(counts, key=lambda k: -counts[k])[:12]
+
+
+def make_c4_context(modules: dict, project_name: str, all_module_names: list) -> list:
+    """Return lines for C4Context diagram."""
+    ext_deps = collect_external_deps(modules, all_module_names)
+    all_files: dict = {}
+    for data in modules.values():
+        all_files.update(data.get('files', {}))
+    tech = detect_tech(all_files)
+    proj = c4_alias(project_name)
+
+    _DB = {'postgres', 'postgresql', 'mysql', 'mongodb', 'mongo', 'redis',
+           'sqlite', 'elasticsearch', 'cassandra', 'dynamodb', 'mariadb', 'mssql'}
+    _QUEUE = {'kafka', 'rabbitmq', 'celery', 'amqp', 'sqs', 'pubsub', 'nats', 'zeromq'}
+
+    lines = [
+        '```mermaid', 'C4Context',
+        f'  title System Context — {project_name}', '',
+        f'  System({proj}, "{project_name}", "{tech} application")',
+    ]
+    for dep in ext_deps:
+        alias = c4_alias(dep)
+        if dep in _DB:
+            lines.append(f'  SystemDb_Ext({alias}, "{dep}", "External database")')
+        elif dep in _QUEUE:
+            lines.append(f'  SystemQueue_Ext({alias}, "{dep}", "Message broker")')
+        else:
+            lines.append(f'  System_Ext({alias}, "{dep}", "External dependency")')
+    lines.append('')
+    for dep in ext_deps:
+        lines.append(f'  Rel({proj}, {c4_alias(dep)}, "uses")')
+    lines.append('```')
+    return lines
+
+
+def make_c4_container(modules: dict, project_name: str, root: Path) -> list:
+    """Return lines for C4Container diagram (top-level modules only)."""
+    top: dict = {}
+    for mod, data in modules.items():
+        dp = data.get('dir_path')
+        if dp:
+            try:
+                depth = len(dp.relative_to(root).parts)
+            except ValueError:
+                depth = 99
+            if depth <= 2:
+                top[mod] = data
+    if not top:
+        top = dict(list(modules.items())[:20])
+
+    proj = c4_alias(project_name)
+    lines = [
+        '```mermaid', 'C4Container',
+        f'  title Container diagram — {project_name}', '',
+        f'  System_Boundary({proj}, "{project_name}") {{',
+    ]
+    for mod, data in top.items():
+        alias = c4_alias(mod)
+        label = mod.split('/')[-1]
+        tech = detect_tech(data.get('files', {}))
+        kw = data.get('keywords', [])[:3]
+        descr = c4_label(', '.join(kw)) if kw else label
+        ctype = module_container_type(mod)
+        lines.append(f'    {ctype}({alias}, "{label}", "{tech}", "{descr}")')
+    lines.append('  }')
+    lines.append('')
+    top_set = set(top)
+    for mod, data in top.items():
+        src = c4_alias(mod)
+        for dep in data.get('deps', []):
+            if dep in top_set:
+                lines.append(f'  Rel({src}, {c4_alias(dep)}, "uses")')
+    lines.append('```')
+    return lines
+
+
+def make_c4_component(mod: str, files_data: dict) -> list:
+    """Return lines for C4Component diagram for a single module."""
+    if not files_data:
+        return []
+    tech = detect_tech(files_data)
+    mod_alias = c4_alias(mod)
+
+    # Build file → alias map (only files with functions, max 15)
+    file_aliases: dict = {}
+    for fname, fd in list(files_data.items())[:15]:
+        if fd.get('functions'):
+            base = re.sub(r'\.(py|go|ts|js|tsx|jsx)$', '', fname)
+            file_aliases[fname] = c4_alias(base)
+
+    if not file_aliases:
+        return []
+
+    lines = [
+        '```mermaid', 'C4Component',
+        f'  title Component diagram — {mod}', '',
+        f'  Container_Boundary({mod_alias}, "{mod}") {{',
+    ]
+    for fname, alias in file_aliases.items():
+        funcs = files_data[fname].get('functions', [])
+        func_names = [fn['name'] for fn in funcs[:3]]
+        descr = c4_label(', '.join(func_names))
+        lines.append(f'    Component({alias}, "{fname}", "{tech}", "{descr}")')
+    lines.append('  }')
+    lines.append('')
+
+    added: set = set()
+    for fname, alias in file_aliases.items():
+        all_calls: set = set()
+        for fn in files_data[fname].get('functions', []):
+            all_calls.update(fn.get('calls', []))
+        for other_fname, other_alias in file_aliases.items():
+            if other_fname == fname:
+                continue
+            other_base = re.sub(r'\.(py|go|ts|js|tsx|jsx)$', '', other_fname)
+            if any(other_base in call or call in other_base for call in all_calls):
+                key = (alias, other_alias)
+                if key not in added:
+                    added.add(key)
+                    lines.append(f'  Rel({alias}, {other_alias}, "calls")')
+    lines.append('```')
+    return lines
+
+
+# ─────────────────────────────────────────────
 # CONTEXT.MD GENERATORS
 # ─────────────────────────────────────────────
 
@@ -461,11 +654,18 @@ def make_context_md(dir_path: Path, root: Path, all_modules: list, reverse_deps:
 
     lines.append(f"**tags:** {' '.join(sorted(tags)[:16])}")
     lines.append(f"**updated:** {now} ndoc")
+
+    # C4 Component diagram
+    c4_lines = make_c4_component(mod, files_data)
+    if c4_lines:
+        lines += ['', '## C4 Component', ''] + c4_lines
+
     return '\n'.join(lines)
 
 
-def make_index(modules: dict, project_name: str) -> str:
+def make_index(modules: dict, project_name: str, root: Path = None) -> str:
     now = datetime.now().strftime('%Y-%m-%d')
+    all_module_names = list(modules.keys())
 
     lines = [
         f"# Project: {project_name} | modules: {len(modules)} | updated: {now}",
@@ -482,17 +682,17 @@ def make_index(modules: dict, project_name: str) -> str:
             line += f" | {', '.join(kw)}"
         lines.append(line)
 
-    # Build graph chains
+    # Dependency chains (Graph)
     dep_graph = {mod: data.get('deps', []) for mod, data in modules.items()}
     all_deps_flat = {d for deps in dep_graph.values() for d in deps}
     entry_points = [m for m in modules if m not in all_deps_flat]
 
     lines += ["", "## Graph"]
-    seen_chains = set()
+    seen_chains: set = set()
     for entry in (entry_points or list(modules.keys()))[:6]:
         chain = [entry]
         current = entry
-        for _ in range(6):
+        for _ in range(8):
             deps = dep_graph.get(current, [])
             if not deps:
                 break
@@ -507,13 +707,13 @@ def make_index(modules: dict, project_name: str) -> str:
                 seen_chains.add(chain_str)
                 lines.append(chain_str)
 
-    # Mermaid graph
-    lines += ["", "## Mermaid", "", "```mermaid", "graph TD"]
-    for mod, data in modules.items():
-        for dep in data.get('deps', []):
-            if dep in modules:
-                lines.append(f"    {mod} --> {dep}")
-    lines.append("```")
+    # C4 Context
+    lines += ["", "## C4 Context", ""]
+    lines += make_c4_context(modules, project_name, all_module_names)
+
+    # C4 Container
+    lines += ["", "## C4 Container", ""]
+    lines += make_c4_container(modules, project_name, root or Path('.'))
 
     return '\n'.join(lines)
 
@@ -634,7 +834,7 @@ def ndoc_init(project_path: str = "") -> str:
 
     # context.index.md
     out.append(f"\n🗺️  Шаг 4/5 — context.index.md...")
-    index_content = make_index(modules, root.name)
+    index_content = make_index(modules, root.name, root)
     (root / 'context.index.md').write_text(index_content, encoding='utf-8')
     out.append(f"   ✓ context.index.md — {len(modules)} модулей")
     out.append(f"   ✓ Map + Graph + Mermaid диаграмма")
@@ -747,7 +947,7 @@ def ndoc_update(project_path: str = "", changed_files: str = "") -> str:
         content = make_context_md(dp, root, all_module_names, reverse_deps)
         (dp / 'context.md').write_text(content, encoding='utf-8')
 
-    (root / 'context.index.md').write_text(make_index(modules, root.name), encoding='utf-8')
+    (root / 'context.index.md').write_text(make_index(modules, root.name, root), encoding='utf-8')
     out.append(f"\n   ✓ context.index.md обновлён")
     out.append(f"\n✅ Обновлено {updated} context.md файлов")
     return '\n'.join(out)
