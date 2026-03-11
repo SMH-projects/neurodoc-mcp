@@ -413,7 +413,7 @@ def c4_alias(name: str) -> str:
 
 
 def c4_label(s: str) -> str:
-    return s.replace('"', "'")[:60]
+    return s.replace('"', "'")[:120]
 
 
 def module_container_type(mod_name: str) -> str:
@@ -1398,10 +1398,26 @@ import json as _json
 # AGENT FINDINGS → C4 GENERATORS
 # ─────────────────────────────────────────────
 
+_SYSTEM_SYNONYMS: dict = {
+    'postgres': 'postgresql',
+    'pg': 'postgresql',
+    'mongo': 'mongodb',
+    'mssql': 'sqlserver',
+    'maria': 'mariadb',
+    'rabbit': 'rabbitmq',
+    'rmq': 'rabbitmq',
+    'elastic': 'elasticsearch',
+    'es': 'elasticsearch',
+    'clickhouse': 'clickhouse',
+}
+
+
 def _normalize_system_name(name: str) -> str:
-    """Normalize for dedup: 'PostgreSQL 15' → 'postgresql', 'Redis 7.0' → 'redis'."""
-    n = re.sub(r'\s+\d[\d.x]*$', '', name.strip(), flags=re.IGNORECASE)
-    return n.lower().replace(' ', '').replace('-', '').replace('_', '')
+    """Normalize for dedup: 'PostgreSQL 15' → 'postgresql', 'postgres' → 'postgresql'."""
+    # Strip trailing version numbers
+    n = re.sub(r'[\s:_-]+\d[\d.x]*$', '', name.strip(), flags=re.IGNORECASE)
+    n = n.lower().replace(' ', '').replace('-', '').replace('_', '')
+    return _SYSTEM_SYNONYMS.get(n, n)
 
 
 def _collect_ext_deps(layers: list) -> dict:
@@ -1470,21 +1486,73 @@ def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
     return lines
 
 
+def _extract_docker_services(layers: list) -> dict:
+    """
+    Parse Docker/Infrastructure layer key_components into real services.
+    Returns {normalized_name: {display, type, label}} for infra-defined systems.
+    Docker/infra layer itself is NOT a C4 container — it's a deployment descriptor.
+    """
+    services: dict = {}
+    _INFRA_KEYS = ('infra', 'docker', 'infrastructure')
+    for layer in layers:
+        if not any(k in layer.get('name', '').lower() for k in _INFRA_KEYS):
+            continue
+        for comp in layer.get('key_components', []):
+            # key_components can be string or {name, image, purpose}
+            if isinstance(comp, dict):
+                name = comp.get('name', '') or comp.get('image', '')
+                purpose = comp.get('purpose', '')
+            else:
+                name = str(comp)
+                purpose = ''
+            name = name.strip()
+            if not name or len(name) < 2:
+                continue
+            # Determine type from name/purpose
+            lower = (name + ' ' + purpose).lower()
+            if any(k in lower for k in ('postgres', 'mysql', 'mariadb', 'mongo', 'sqlite', 'clickhouse', 'mssql')):
+                stype = 'database'
+            elif any(k in lower for k in ('redis', 'memcach', 'valkey')):
+                stype = 'cache'
+            elif any(k in lower for k in ('kafka', 'rabbitmq', 'nats', 'activemq', 'sqs', 'pubsub')):
+                stype = 'queue'
+            elif any(k in lower for k in ('nginx', 'traefik', 'haproxy', 'caddy', 'envoy')):
+                stype = 'proxy'
+            elif any(k in lower for k in ('prometheus', 'grafana', 'jaeger', 'tempo', 'loki', 'datadog')):
+                stype = 'monitoring'
+            else:
+                stype = 'service'
+            key = _normalize_system_name(name)
+            if key not in services:
+                services[key] = {
+                    'display': name,
+                    'type': stype,
+                    'label': get_rel_label(name) if stype != 'proxy' else 'routes traffic',
+                }
+    return services
+
+
 def make_c4_container_from_findings(findings: dict, project_name: str) -> list:
     """
-    Generate C4Container — only DEPLOYABLE UNITS (binaries, databases, services).
-    Go packages / Python modules / Laravel modules go to C4Component level.
+    Generate C4Container — only DEPLOYABLE UNITS.
+    - Docker/Infrastructure layer is skipped as a container (it's a deployment descriptor)
+    - Its key_components (postgres, redis, ...) become real C4 containers inside the boundary
+    - External systems from agent findings go outside the boundary
     """
     proj = c4_alias(project_name)
     layers = findings.get('layers', [])
     cross_rels = findings.get('cross_layer_relations', [])
-    # External systems that are deployable (DB, queue, cache)
-    ext_systems: dict = {}
-    for layer in layers:
-        for dep in layer.get('external_deps', []):
-            name = dep.get('name', '').strip()
-            if name and is_real_external_system(name):
-                ext_systems[name] = dep
+
+    _SKIP_LAYERS = ('proto', 'protobuf', 'generated', 'gen', 'infra', 'docker', 'infrastructure')
+    _INFRA_KEYS = ('infra', 'docker', 'infrastructure')
+    _DB_TYPES = {'database', 'db'}
+    _QUEUE_TYPES = {'queue', 'broker', 'messaging'}
+
+    # External systems from all agent findings (deduped)
+    ext_deps = _collect_ext_deps(layers)
+
+    # Services defined in Docker compose / infra layer
+    docker_services = _extract_docker_services(layers)
 
     lines = ['```mermaid', 'C4Container', f'  title Container diagram — {project_name}', '']
     lines.append(f'  Person(user, "User", "End-user of {project_name}")')
@@ -1492,13 +1560,12 @@ def make_c4_container_from_findings(findings: dict, project_name: str) -> list:
 
     alias_map: dict = {}
 
-    # System boundary — only architectural layers (deployable units)
     lines.append(f'  System_Boundary({proj}, "{project_name}") {{')
-    for layer in layers:
+
+    # 1. Real application layers (skip infra/proto/gen)
+    app_layers = [l for l in layers if not any(k in l.get('name', '').lower() for k in _SKIP_LAYERS)]
+    for layer in app_layers:
         name = layer.get('name', 'Unknown')
-        # Skip pure protobuf/generated layers — they're part of backend binary
-        if any(k in name.lower() for k in ('proto', 'protobuf', 'generated', 'gen')):
-            continue
         alias = c4_alias(name)
         alias_map[name] = alias
         tech = layer.get('tech', 'Code')
@@ -1508,35 +1575,58 @@ def make_c4_container_from_findings(findings: dict, project_name: str) -> list:
             ctype = 'ContainerDb'
         elif any(k in name_lower for k in ('queue', 'worker', 'broker', 'consumer')):
             ctype = 'ContainerQueue'
-        elif any(k in name_lower for k in ('infra', 'docker', 'infrastructure')):
-            ctype = 'Container'
         else:
             ctype = 'Container'
         lines.append(f'    {ctype}({alias}, "{name}", "{tech}", "{desc}")')
+
+    # 2. Docker compose services that are deployable within the system (proxy, app services)
+    #    DBs/caches from docker go OUTSIDE as SystemDb_Ext if not already in ext_deps
+    docker_internal: dict = {}  # services that live inside the system boundary
+    for key, info in docker_services.items():
+        stype = info['type']
+        norm = _normalize_system_name(info['display'])
+        # If this service is already covered by ext_deps, skip (avoid duplicate)
+        if norm in ext_deps:
+            continue
+        if stype in ('proxy', 'service'):
+            docker_internal[key] = info
+        else:
+            # database/cache/queue from docker → treat as external deployable
+            ext_deps[norm] = info
+
+    for key, info in docker_internal.items():
+        alias = c4_alias(key)
+        alias_map[info['display']] = alias
+        lines.append(f'    Container({alias}, "{info["display"]}", "Docker", "{info["label"]}")')
+
     lines.append('  }')
     lines.append('')
 
-    # External deployable systems OUTSIDE boundary
-    _DB_TYPES = {'database', 'db'}
-    _QUEUE_TYPES = {'queue', 'broker', 'messaging'}
-    for name, dep in list(ext_systems.items())[:8]:
-        alias = c4_alias(name)
-        alias_map[name] = alias
-        dep_type = dep.get('type', 'other').lower()
-        if dep_type in _DB_TYPES:
-            lines.append(f'  SystemDb_Ext({alias}, "{name}", "Database")')
-        elif dep_type in _QUEUE_TYPES:
-            lines.append(f'  SystemQueue_Ext({alias}, "{name}", "Message broker")')
-        elif dep_type == 'cache':
-            lines.append(f'  SystemDb_Ext({alias}, "{name}", "Cache")')
+    # External systems outside boundary
+    for key, info in list(ext_deps.items())[:10]:
+        alias = c4_alias(key)
+        alias_map[info['display']] = alias
+        stype = info['type'].lower()
+        if stype in _DB_TYPES:
+            lines.append(f'  SystemDb_Ext({alias}, "{info["display"]}", "Database")')
+        elif stype == 'cache':
+            lines.append(f'  SystemDb_Ext({alias}, "{info["display"]}", "Cache")')
+        elif stype in _QUEUE_TYPES:
+            lines.append(f'  SystemQueue_Ext({alias}, "{info["display"]}", "Message broker")')
+        elif stype == 'monitoring':
+            lines.append(f'  System_Ext({alias}, "{info["display"]}", "Monitoring")')
+        elif stype == 'mail':
+            lines.append(f'  System_Ext({alias}, "{info["display"]}", "Email provider")')
+        elif stype == 'payment':
+            lines.append(f'  System_Ext({alias}, "{info["display"]}", "Payment gateway")')
         else:
-            lines.append(f'  System_Ext({alias}, "{name}", "External system")')
+            lines.append(f'  System_Ext({alias}, "{info["display"]}", "External system")')
     lines.append('')
 
-    # User → entry points
-    fe = next((l for l in layers if any(k in l.get('name','').lower() for k in ('front','vue','react','ui','browser','client'))), None)
-    be = next((l for l in layers if any(k in l.get('name','').lower() for k in ('backend','api','server','php','laravel','django','rails','go'))), None)
-    adm = next((l for l in layers if any(k in l.get('name','').lower() for k in ('admin','nova','panel'))), None)
+    # Relationships
+    fe = next((l for l in app_layers if any(k in l.get('name', '').lower() for k in ('front', 'vue', 'react', 'ui', 'browser', 'client'))), None)
+    be = next((l for l in app_layers if any(k in l.get('name', '').lower() for k in ('backend', 'api', 'server', 'php', 'laravel', 'django', 'rails', 'go'))), None)
+    adm = next((l for l in app_layers if any(k in l.get('name', '').lower() for k in ('admin', 'nova', 'panel'))), None)
 
     if fe and fe['name'] in alias_map:
         lines.append(f'  Rel(user, {alias_map[fe["name"]]}, "accesses via browser")')
@@ -1544,34 +1634,117 @@ def make_c4_container_from_findings(findings: dict, project_name: str) -> list:
         lines.append(f'  Rel(user, {alias_map[be["name"]]}, "accesses via HTTP/gRPC")')
     if adm and adm != fe and adm['name'] in alias_map:
         lines.append(f'  Rel(user, {alias_map[adm["name"]]}, "manages via admin panel")')
-
-    # Frontend → Backend
     if fe and be and fe['name'] in alias_map and be['name'] in alias_map:
         lines.append(f'  Rel({alias_map[fe["name"]]}, {alias_map[be["name"]]}, "API requests [HTTP/JSON]")')
-
-    # Admin → Backend
     if adm and be and adm != fe and adm['name'] in alias_map and be['name'] in alias_map:
         lines.append(f'  Rel({alias_map[adm["name"]]}, {alias_map[be["name"]]}, "extends [Nova]")')
 
-    # Explicit cross-layer relations from agent findings
+    # Explicit cross-layer relations
     added: set = set()
     for rel in cross_rels:
         src = rel.get('from', '')
         dst = rel.get('to', '')
         label = rel.get('label', 'uses')
-        if src in alias_map and dst in alias_map:
-            key = (alias_map[src], alias_map[dst])
+        src_alias = alias_map.get(src)
+        dst_alias = alias_map.get(dst)
+        if src_alias and dst_alias:
+            key = (src_alias, dst_alias)
             if key not in added:
                 added.add(key)
-                lines.append(f'  Rel({alias_map[src]}, {alias_map[dst]}, "{label}")')
+                lines.append(f'  Rel({src_alias}, {dst_alias}, "{label}")')
 
-    # Backend / layers → external systems
-    main_layer = be or (layers[0] if layers else None)
+    # Main layer → external systems
+    main_layer = be or (app_layers[0] if app_layers else None)
     if main_layer and main_layer['name'] in alias_map:
         main_alias = alias_map[main_layer['name']]
-        for name, dep in list(ext_systems.items())[:8]:
-            label = dep.get('label') or get_rel_label(name)
-            lines.append(f'  Rel({main_alias}, {alias_map[name]}, "{label}")')
+        for key, info in list(ext_deps.items())[:10]:
+            ext_alias = c4_alias(key)
+            label = info.get('label') or get_rel_label(info['display'])
+            rel_key = (main_alias, ext_alias)
+            if rel_key not in added:
+                added.add(rel_key)
+                lines.append(f'  Rel({main_alias}, {ext_alias}, "{label}")')
+
+    lines.append('```')
+    return lines
+
+
+def make_c4_component_from_findings(layer: dict) -> list:
+    """
+    Generate C4Component for a single architectural layer from agent findings.
+    Uses key_components[] and component_relationships[] returned by agents.
+    """
+    name = layer.get('name', 'Unknown')
+    tech = layer.get('tech', 'Code')
+    components = layer.get('key_components', [])
+    relationships = layer.get('component_relationships', [])
+
+    if not components:
+        return []
+
+    mod_alias = c4_alias(name)
+    comp_aliases: dict = {}  # component name → alias
+
+    lines = [
+        '```mermaid', 'C4Component',
+        f'  title Component diagram — {name}', '',
+        f'  Container_Boundary({mod_alias}, "{name}") {{',
+    ]
+
+    for comp in components[:15]:
+        if isinstance(comp, dict):
+            cname = comp.get('name', '')
+            cpurpose = c4_label(comp.get('purpose', cname))
+        else:
+            cname = str(comp)
+            cpurpose = c4_label(cname)
+        if not cname:
+            continue
+        alias = c4_alias(cname)
+        comp_aliases[cname] = alias
+        # Normalize variations: "AuthHandler" → also reachable as "auth_handler", "auth"
+        comp_aliases[cname.lower()] = alias
+        lines.append(f'    Component({alias}, "{cname}", "{tech}", "{cpurpose}")')
+
+    lines.append('  }')
+    lines.append('')
+
+    # Build relationships from agent-provided data
+    added: set = set()
+    for rel in relationships:
+        src_name = rel.get('from', '')
+        dst_name = rel.get('to', '')
+        label = rel.get('label', 'calls')
+        src_alias = comp_aliases.get(src_name) or comp_aliases.get(src_name.lower())
+        dst_alias = comp_aliases.get(dst_name) or comp_aliases.get(dst_name.lower())
+        if src_alias and dst_alias and src_alias != dst_alias:
+            key = (src_alias, dst_alias)
+            if key not in added:
+                added.add(key)
+                lines.append(f'  Rel({src_alias}, {dst_alias}, "{label}")')
+
+    if not added:
+        # Fallback: infer relationships from naming patterns (handler→service, service→repo)
+        _LAYERS = [
+            (['handler', 'controller', 'router', 'endpoint'], ['service', 'usecase', 'manager'], 'calls'),
+            (['service', 'usecase', 'manager'], ['repo', 'repository', 'store', 'dao'], 'queries'),
+            (['service', 'usecase', 'manager'], ['client', 'provider', 'gateway', 'sender'], 'uses'),
+        ]
+        for comp in components[:15]:
+            cname = str(comp.get('name', comp) if isinstance(comp, dict) else comp).lower()
+            src_alias = comp_aliases.get(cname)
+            if not src_alias:
+                continue
+            for src_patterns, dst_patterns, label in _LAYERS:
+                if any(p in cname for p in src_patterns):
+                    for other in components[:15]:
+                        oname = str(other.get('name', other) if isinstance(other, dict) else other).lower()
+                        dst_alias = comp_aliases.get(oname)
+                        if dst_alias and dst_alias != src_alias and any(p in oname for p in dst_patterns):
+                            key = (src_alias, dst_alias)
+                            if key not in added:
+                                added.add(key)
+                                lines.append(f'  Rel({src_alias}, {dst_alias}, "{label}")')
 
     lines.append('```')
     return lines
@@ -1672,7 +1845,7 @@ def detect_project_layers(root: Path) -> list:
             f"4. Find API layer: HTTP routes or gRPC services\n"
             f"5. Find: DB driver, cache, queue, external HTTP clients\n"
             f"6. Map cross-package data flow\n\n"
-            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
         for proto_dir in ('proto', 'gen', 'pb'):
             if (go_root / proto_dir).exists():
@@ -1708,7 +1881,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Read routes/ — list API/web endpoints grouped by domain\n"
             f"4. Find: DB type, cache (Redis?), queue driver, external APIs\n"
             f"5. Map layer interactions\n\n"
-            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
         # Laravel Nova
         nova_path = php_root / 'nova-components'
@@ -1757,7 +1930,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find API endpoints (FastAPI routes, Django urls, Flask blueprints)\n"
             f"4. Find: DB (SQLAlchemy/Django ORM/etc), cache, queue (Celery?), external HTTP clients\n"
             f"5. Map data flow between layers\n\n"
-            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Node.js / TypeScript ──
@@ -1809,7 +1982,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find REST endpoints (@RestController, @GetMapping etc)\n"
             f"4. Find: DB (JPA/Hibernate/JDBC), cache (Redis?), queue (Kafka/RabbitMQ?), external clients\n"
             f"5. Map Spring beans and their relationships\n\n"
-            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Rust ──
@@ -1826,7 +1999,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find API layer (Axum/Actix/Warp routes)\n"
             f"4. Find: DB (sqlx/diesel/sea-orm), cache, queue, external HTTP clients\n"
             f"5. Map module dependencies\n\n"
-            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Ruby / Rails ──
@@ -1844,7 +2017,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Read config/routes.rb — list API endpoints\n"
             f"4. Find: DB (ActiveRecord adapter), cache (Redis?), queue (Sidekiq?), external APIs\n"
             f"5. Map layer interactions\n\n"
-            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── .NET / C# ──
@@ -1866,7 +2039,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find API endpoints (ASP.NET controllers, minimal APIs)\n"
             f"4. Find: DB (EF Core/Dapper), cache, queue (MassTransit/RabbitMQ?), external clients\n"
             f"5. Map dependency injection registrations\n\n"
-            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Frontend (standalone Vue/React/Angular) ──
@@ -1924,7 +2097,7 @@ def detect_project_layers(root: Path) -> list:
                 f"3. List key components with their purpose\n"
                 f"4. Find external dependencies (databases, APIs, services)\n"
                 f"5. Map component relationships\n\n"
-                f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+                f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
             ),
         })
 
@@ -2202,14 +2375,43 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
     else:
         index_lines += make_c4_container(modules, project_name, root)
 
+    # C4 Component — one diagram per non-infra layer that has key_components
+    if layers_info:
+        comp_sections = []
+        _SKIP = ('proto', 'protobuf', 'generated', 'gen', 'infra', 'docker', 'infrastructure')
+        for layer in layers_info:
+            if any(k in layer.get('name', '').lower() for k in _SKIP):
+                continue
+            comp_lines = make_c4_component_from_findings(layer)
+            if comp_lines:
+                comp_sections.append(('## C4 Component — ' + layer['name'], comp_lines))
+        if comp_sections:
+            for section_title, comp_lines in comp_sections:
+                index_lines.append("")
+                index_lines.append(section_title)
+                index_lines.append("")
+                index_lines += comp_lines
+
     # Sequence diagrams (from agent findings)
     if data.get('key_flows'):
         index_lines.append("")
         index_lines.append("## Key Flows")
         index_lines += make_sequence_from_findings(data, project_name)
 
+    # Also collect key_flows from individual layers
+    layer_flows = []
+    for layer in layers_info:
+        for flow in layer.get('key_flows', []):
+            layer_flows.append(flow)
+    if layer_flows and not data.get('key_flows'):
+        data_with_flows = dict(data)
+        data_with_flows['key_flows'] = layer_flows
+        index_lines.append("")
+        index_lines.append("## Key Flows")
+        index_lines += make_sequence_from_findings(data_with_flows, project_name)
+
     (root / 'context.index.md').write_text('\n'.join(index_lines), encoding='utf-8')
-    out.append("   ok: context.index.md written with C4 Context + C4 Container from agent findings")
+    out.append("   ok: context.index.md written with C4 Context + C4 Container + C4 Component from agent findings")
 
     # ── Step 4: Update CLAUDE.md ──
     out.append("\nStep 4/4 — Updating CLAUDE.md...")
