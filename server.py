@@ -450,6 +450,105 @@ _STDLIB_NOISE = {
     'process', 'console', 'timers', 'perf_hooks',
 }
 
+# Libraries/frameworks that should NOT appear as external systems in C4 Context.
+# These are code dependencies, not architectural systems.
+_LIBRARY_NOISE = {
+    # Go frameworks & tooling
+    'grpc', 'protobuf', 'proto', 'golang', 'google', 'go',
+    'gorilla', 'gin', 'echo', 'fiber', 'chi', 'mux',
+    'gorm', 'sqlx', 'pgx', 'ent', 'bun',
+    'zap', 'logrus', 'zerolog', 'slog',
+    'viper', 'cobra', 'pflag',
+    'testify', 'gomock', 'mockery',
+    'wire', 'fx', 'dig',
+    'jwt', 'uuid', 'validator',
+    'otel', 'opentelemetry', 'jaeger', 'zipkin',
+    # Python frameworks
+    'fastapi', 'flask', 'django', 'starlette', 'uvicorn', 'gunicorn',
+    'sqlalchemy', 'alembic', 'tortoise', 'peewee',
+    'pydantic', 'marshmallow', 'attrs',
+    'celery', 'dramatiq', 'rq',
+    'httpx', 'aiohttp', 'requests',
+    'pytest', 'unittest', 'hypothesis',
+    'boto3', 'botocore',
+    # Node frameworks
+    'axios', 'fetch', 'superagent', 'node-fetch', 'ky', 'undici',
+    'express', 'fastify', 'koa', 'hapi', 'nestjs', 'nest',
+    'prisma', 'typeorm', 'sequelize', 'mongoose', 'knex',
+    'jest', 'mocha', 'vitest', 'chai',
+    'webpack', 'vite', 'esbuild', 'rollup', 'babel',
+    'eslint', 'prettier', 'typescript',
+    'lodash', 'underscore', 'ramda', 'dayjs', 'moment',
+    'zod', 'yup', 'joi',
+    # Java frameworks
+    'spring', 'springframework', 'hibernate', 'lombok',
+    'junit', 'mockito', 'assertj',
+    # PHP frameworks
+    'laravel', 'symfony', 'slim', 'lumen',
+    'eloquent', 'doctrine',
+    # Ruby frameworks
+    'rails', 'sinatra', 'hanami',
+    'activerecord', 'rspec',
+    # Rust frameworks
+    'tokio', 'actix', 'axum', 'warp', 'rocket',
+    'serde', 'reqwest', 'sqlx',
+    # .NET frameworks
+    'aspnet', 'efcore', 'xunit', 'nunit',
+    # Generic
+    'utils', 'helpers', 'common', 'shared', 'core', 'base',
+    'config', 'internal', 'pkg', 'lib', 'src',
+}
+
+# Only these qualify as real external SYSTEMS in C4 Context
+_REAL_EXTERNAL_SYSTEMS = {
+    # Databases
+    'postgres', 'postgresql', 'mysql', 'mariadb', 'mongodb', 'mongo',
+    'sqlite', 'mssql', 'cockroachdb', 'dynamodb', 'cassandra', 'neo4j',
+    'clickhouse', 'bigquery', 'snowflake', 'redshift',
+    # Cache
+    'redis', 'memcached', 'dragonflydb',
+    # Message brokers / queues
+    'kafka', 'rabbitmq', 'nats', 'pulsar', 'sqs', 'pubsub',
+    'activemq', 'zeromq', 'celery',
+    # Search
+    'elasticsearch', 'opensearch', 'algolia', 'typesense', 'meilisearch',
+    # Storage
+    's3', 'gcs', 'minio', 'cloudinary', 'azure',
+    # Email providers
+    'mailgun', 'sendgrid', 'postmark', 'ses', 'smtp', 'mandrill', 'sparkpost',
+    # Monitoring / Observability
+    'prometheus', 'grafana', 'datadog', 'newrelic', 'sentry', 'bugsnag',
+    'honeycomb', 'lightstep', 'dynatrace',
+    # Payment
+    'stripe', 'paypal', 'braintree', 'square', 'adyen',
+    # Auth providers
+    'auth0', 'okta', 'keycloak', 'cognito', 'firebase',
+    # CDN / Infra
+    'cloudflare', 'nginx', 'traefik', 'envoy',
+    # Specific external APIs (user-named)
+    'twilio', 'plivo', 'vonage', 'pusher', 'ably',
+    'github', 'gitlab', 'jira', 'slack', 'discord',
+    'google', 'facebook', 'twitter', 'apple',
+}
+
+
+def is_real_external_system(name: str) -> bool:
+    """Return True only if this dep is an actual external system (not a library)."""
+    n = name.lower().replace('-', '').replace('_', '').replace('.', '')
+    # Check exact match in real systems
+    if n in _REAL_EXTERNAL_SYSTEMS or name.lower() in _REAL_EXTERNAL_SYSTEMS:
+        return True
+    # Check if it's known library noise
+    if n in _LIBRARY_NOISE or name.lower() in _LIBRARY_NOISE:
+        return False
+    # Check stdlib
+    if name.lower() in _STDLIB_NOISE:
+        return False
+    # Heuristic: Go module paths like "google.golang.org/grpc" → library
+    if re.search(r'\.(go|org|com|io|dev|net)\b', name.lower()):
+        return False
+    return True
+
 
 # ─────────────────────────────────────────────
 # RELATIONSHIP LABELS
@@ -1300,25 +1399,30 @@ import json as _json
 # ─────────────────────────────────────────────
 
 def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
-    """Generate C4Context from agent findings JSON."""
+    """Generate C4Context from agent findings — only real external systems."""
     proj = c4_alias(project_name)
     layers = findings.get('layers', [])
     techs = [l.get('tech', '') for l in layers if l.get('tech')]
     main_tech = techs[0] if techs else 'Application'
 
-    # Collect external deps with labels
+    # Collect REAL external systems only (not libraries/frameworks)
     ext_deps: dict = {}
     for layer in layers:
         for dep in layer.get('external_deps', []):
             name = dep.get('name', '').strip()
-            if name and len(name) >= 2:
+            if not name or len(name) < 2:
+                continue
+            # Skip libraries — only keep real external systems
+            if not is_real_external_system(name):
+                continue
+            if name not in ext_deps:
                 ext_deps[name] = {
                     'type': dep.get('type', 'other'),
                     'label': dep.get('label') or get_rel_label(name),
                 }
 
-    _DB = {'database'}
-    _QUEUE = {'queue', 'broker'}
+    _DB_TYPES = {'database', 'db'}
+    _QUEUE_TYPES = {'queue', 'broker', 'messaging'}
 
     lines = [
         '```mermaid', 'C4Context',
@@ -1329,11 +1433,17 @@ def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
     ]
     for name, info in list(ext_deps.items())[:12]:
         alias = c4_alias(name)
-        dep_type = info['type']
-        if dep_type in _DB:
+        dep_type = info['type'].lower()
+        if dep_type in _DB_TYPES:
             lines.append(f'  SystemDb_Ext({alias}, "{name}", "Database")')
-        elif dep_type in _QUEUE:
+        elif dep_type in _QUEUE_TYPES:
             lines.append(f'  SystemQueue_Ext({alias}, "{name}", "Message broker")')
+        elif dep_type == 'mail':
+            lines.append(f'  System_Ext({alias}, "{name}", "Email provider")')
+        elif dep_type == 'monitoring':
+            lines.append(f'  System_Ext({alias}, "{name}", "Monitoring")')
+        elif dep_type == 'payment':
+            lines.append(f'  System_Ext({alias}, "{name}", "Payment gateway")')
         else:
             lines.append(f'  System_Ext({alias}, "{name}", "External system")')
     lines.append('')
@@ -1345,83 +1455,151 @@ def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
 
 
 def make_c4_container_from_findings(findings: dict, project_name: str) -> list:
-    """Generate C4Container from agent findings JSON."""
+    """
+    Generate C4Container — only DEPLOYABLE UNITS (binaries, databases, services).
+    Go packages / Python modules / Laravel modules go to C4Component level.
+    """
     proj = c4_alias(project_name)
     layers = findings.get('layers', [])
-    modules = findings.get('modules', [])
     cross_rels = findings.get('cross_layer_relations', [])
+    # External systems that are deployable (DB, queue, cache)
+    ext_systems: dict = {}
+    for layer in layers:
+        for dep in layer.get('external_deps', []):
+            name = dep.get('name', '').strip()
+            if name and is_real_external_system(name):
+                ext_systems[name] = dep
 
     lines = ['```mermaid', 'C4Container', f'  title Container diagram — {project_name}', '']
     lines.append(f'  Person(user, "User", "End-user of {project_name}")')
     lines.append('')
-    lines.append(f'  System_Boundary({proj}, "{project_name}") {{')
 
     alias_map: dict = {}
 
+    # System boundary — only architectural layers (deployable units)
+    lines.append(f'  System_Boundary({proj}, "{project_name}") {{')
     for layer in layers:
         name = layer.get('name', 'Unknown')
+        # Skip pure protobuf/generated layers — they're part of backend binary
+        if any(k in name.lower() for k in ('proto', 'protobuf', 'generated', 'gen')):
+            continue
         alias = c4_alias(name)
         alias_map[name] = alias
         tech = layer.get('tech', 'Code')
         desc = c4_label(layer.get('description', name))
         name_lower = name.lower()
-        if any(k in name_lower for k in ('db', 'database', 'redis', 'mongo', 'store')):
+        if any(k in name_lower for k in ('db', 'database', 'store')):
             ctype = 'ContainerDb'
-        elif any(k in name_lower for k in ('queue', 'worker', 'broker')):
+        elif any(k in name_lower for k in ('queue', 'worker', 'broker', 'consumer')):
             ctype = 'ContainerQueue'
+        elif any(k in name_lower for k in ('infra', 'docker', 'infrastructure')):
+            ctype = 'Container'
         else:
             ctype = 'Container'
         lines.append(f'    {ctype}({alias}, "{name}", "{tech}", "{desc}")')
-
-    for mod in modules[:6]:
-        mod_name = mod.get('name', '')
-        if not mod_name:
-            continue
-        alias = c4_alias(mod_name)
-        alias_map[mod_name] = alias
-        desc = c4_label(mod.get('description', mod_name))
-        lines.append(f'    Container({alias}, "{mod_name}", "Module", "{desc}")')
-
     lines.append('  }')
     lines.append('')
 
+    # External deployable systems OUTSIDE boundary
+    _DB_TYPES = {'database', 'db'}
+    _QUEUE_TYPES = {'queue', 'broker', 'messaging'}
+    for name, dep in list(ext_systems.items())[:8]:
+        alias = c4_alias(name)
+        alias_map[name] = alias
+        dep_type = dep.get('type', 'other').lower()
+        if dep_type in _DB_TYPES:
+            lines.append(f'  SystemDb_Ext({alias}, "{name}", "Database")')
+        elif dep_type in _QUEUE_TYPES:
+            lines.append(f'  SystemQueue_Ext({alias}, "{name}", "Message broker")')
+        elif dep_type == 'cache':
+            lines.append(f'  SystemDb_Ext({alias}, "{name}", "Cache")')
+        else:
+            lines.append(f'  System_Ext({alias}, "{name}", "External system")')
+    lines.append('')
+
     # User → entry points
-    fe = next((l for l in layers if any(k in l.get('name','').lower() for k in ('front','vue','react','js','ui','browser'))), None)
-    be = next((l for l in layers if any(k in l.get('name','').lower() for k in ('back','api','server','php','laravel','django','rails'))), None)
+    fe = next((l for l in layers if any(k in l.get('name','').lower() for k in ('front','vue','react','ui','browser','client'))), None)
+    be = next((l for l in layers if any(k in l.get('name','').lower() for k in ('backend','api','server','php','laravel','django','rails','go'))), None)
     adm = next((l for l in layers if any(k in l.get('name','').lower() for k in ('admin','nova','panel'))), None)
 
     if fe and fe['name'] in alias_map:
         lines.append(f'  Rel(user, {alias_map[fe["name"]]}, "accesses via browser")')
     elif be and be['name'] in alias_map:
-        lines.append(f'  Rel(user, {alias_map[be["name"]]}, "accesses via browser")')
-    if adm and adm['name'] in alias_map and adm != fe:
+        lines.append(f'  Rel(user, {alias_map[be["name"]]}, "accesses via HTTP/gRPC")')
+    if adm and adm != fe and adm['name'] in alias_map:
         lines.append(f'  Rel(user, {alias_map[adm["name"]]}, "manages via admin panel")')
 
+    # Frontend → Backend
+    if fe and be and fe['name'] in alias_map and be['name'] in alias_map:
+        lines.append(f'  Rel({alias_map[fe["name"]]}, {alias_map[be["name"]]}, "API requests [HTTP/JSON]")')
+
+    # Admin → Backend
+    if adm and be and adm != fe and adm['name'] in alias_map and be['name'] in alias_map:
+        lines.append(f'  Rel({alias_map[adm["name"]]}, {alias_map[be["name"]]}, "extends [Nova]")')
+
     # Explicit cross-layer relations from agent findings
+    added: set = set()
     for rel in cross_rels:
         src = rel.get('from', '')
         dst = rel.get('to', '')
         label = rel.get('label', 'uses')
         if src in alias_map and dst in alias_map:
-            lines.append(f'  Rel({alias_map[src]}, {alias_map[dst]}, "{label}")')
+            key = (alias_map[src], alias_map[dst])
+            if key not in added:
+                added.add(key)
+                lines.append(f'  Rel({alias_map[src]}, {alias_map[dst]}, "{label}")')
 
-    # Backend → Modules
-    if be and modules:
-        be_alias = alias_map.get(be['name'])
-        for mod in modules[:5]:
-            mod_alias = alias_map.get(mod.get('name', ''))
-            if be_alias and mod_alias:
-                lines.append(f'  Rel({be_alias}, {mod_alias}, "delegates to")')
-
-    # Module inter-dependencies
-    for mod in modules:
-        mod_name = mod.get('name', '')
-        for dep in mod.get('depends_on', []):
-            if mod_name in alias_map and dep in alias_map:
-                lines.append(f'  Rel({alias_map[mod_name]}, {alias_map[dep]}, "uses")')
+    # Backend / layers → external systems
+    main_layer = be or (layers[0] if layers else None)
+    if main_layer and main_layer['name'] in alias_map:
+        main_alias = alias_map[main_layer['name']]
+        for name, dep in list(ext_systems.items())[:8]:
+            label = dep.get('label') or get_rel_label(name)
+            lines.append(f'  Rel({main_alias}, {alias_map[name]}, "{label}")')
 
     lines.append('```')
     return lines
+
+
+def make_sequence_from_findings(findings: dict, project_name: str) -> list:
+    """Generate Mermaid sequence diagrams for key flows from agent findings."""
+    flows = findings.get('key_flows', [])
+    if not flows:
+        return []
+
+    all_lines = []
+    for flow in flows[:3]:  # max 3 sequence diagrams
+        title = flow.get('title', 'Main Flow')
+        steps = flow.get('steps', [])
+        if not steps:
+            continue
+        lines = [
+            '```mermaid', 'sequenceDiagram',
+            f'  title {title}',
+        ]
+        # Collect actors
+        actors: list = []
+        for step in steps:
+            src = step.get('from', '')
+            dst = step.get('to', '')
+            for a in [src, dst]:
+                if a and a not in actors:
+                    actors.append(a)
+        for actor in actors:
+            lines.append(f'  participant {c4_alias(actor)} as {actor}')
+        lines.append('')
+        for step in steps:
+            src = c4_alias(step.get('from', 'Client'))
+            dst = c4_alias(step.get('to', 'Server'))
+            msg = step.get('message', 'calls')
+            arrow = '->>' if step.get('async') else '->>'
+            lines.append(f'  {src}->>{dst}: {msg}')
+            if step.get('response'):
+                lines.append(f'  {dst}-->>{src}: {step["response"]}')
+        lines.append('```')
+        all_lines += ['', f'### Sequence: {title}', ''] + lines
+
+    return all_lines
 
 
 def _search(root: Path, names: list, max_depth: int = 2) -> Path | None:
@@ -1861,7 +2039,25 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
     try:
         data = _json.loads(findings)
     except _json.JSONDecodeError as e:
-        return f"❌ Ошибка парсинга findings JSON: {e}"
+        return f"Error parsing findings JSON: {e}"
+
+    # Normalize key_components — coerce dicts/objects to strings to prevent crash
+    for layer in data.get('layers', []):
+        kc = layer.get('key_components', [])
+        layer['key_components'] = [
+            item if isinstance(item, str)
+            else item.get('name', str(item)) if isinstance(item, dict)
+            else str(item)
+            for item in kc
+        ]
+    for mod in data.get('modules', []):
+        kc = mod.get('key_components', [])
+        mod['key_components'] = [
+            item if isinstance(item, str)
+            else item.get('name', str(item)) if isinstance(item, dict)
+            else str(item)
+            for item in kc
+        ]
 
     project_name = data.get('project', root.name)
     out = [f"NeuroDoc Generate — {project_name}", "=" * 52, ""]
@@ -1989,6 +2185,12 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
         index_lines += make_c4_container_from_findings(data, project_name)
     else:
         index_lines += make_c4_container(modules, project_name, root)
+
+    # Sequence diagrams (from agent findings)
+    if data.get('key_flows'):
+        index_lines.append("")
+        index_lines.append("## Key Flows")
+        index_lines += make_sequence_from_findings(data, project_name)
 
     (root / 'context.index.md').write_text('\n'.join(index_lines), encoding='utf-8')
     out.append("   ok: context.index.md written with C4 Context + C4 Container from agent findings")
