@@ -61,6 +61,25 @@ SKIP_DIRS = {
 
 CODE_EXTENSIONS = {'.py', '.js', '.ts', '.jsx', '.tsx', '.go'}
 
+_MINIFIED_RE = re.compile(
+    r'(\.min\.|[.\-]bundle\.|[.\-]bundle-|-bundle\b)',
+    re.IGNORECASE,
+)
+
+def is_minified_file(filepath: Path) -> bool:
+    """Detect minified/bundled files by name or line length."""
+    if _MINIFIED_RE.search(filepath.name):
+        return True
+    try:
+        with filepath.open(encoding='utf-8', errors='ignore') as fh:
+            sample = [fh.readline() for _ in range(5)]
+        non_empty = [l for l in sample if l.strip()]
+        if non_empty and sum(len(l) for l in non_empty) / len(non_empty) > 250:
+            return True
+    except Exception:
+        pass
+    return False
+
 
 # ─────────────────────────────────────────────
 # BODY EXTRACTOR (brace counting)
@@ -201,6 +220,8 @@ def get_js_calls_in_body(body: str, import_map: dict) -> list:
 
 
 def parse_js_ts(filepath: Path) -> dict:
+    if is_minified_file(filepath):
+        return {'functions': [], 'imports': []}
     try:
         source = filepath.read_text(encoding='utf-8', errors='ignore')
     except Exception:
@@ -430,6 +451,79 @@ _STDLIB_NOISE = {
 }
 
 
+# ─────────────────────────────────────────────
+# RELATIONSHIP LABELS
+# ─────────────────────────────────────────────
+
+_REL_LABELS: dict = {
+    # Databases
+    'postgres': 'reads/writes data',
+    'postgresql': 'reads/writes data',
+    'mysql': 'reads/writes data',
+    'mariadb': 'reads/writes data',
+    'mongodb': 'reads/writes data',
+    'mongo': 'reads/writes data',
+    'sqlite': 'reads/writes data',
+    'mssql': 'reads/writes data',
+    'dynamodb': 'reads/writes data',
+    'cassandra': 'reads/writes data',
+    # Cache
+    'redis': 'caches data via',
+    'memcached': 'caches data via',
+    # HTTP / API
+    'axios': 'makes HTTP requests via',
+    'httpx': 'makes HTTP requests via',
+    'requests': 'makes HTTP requests via',
+    'got': 'makes HTTP requests via',
+    'superagent': 'makes HTTP requests via',
+    'guzzle': 'makes HTTP requests via',
+    # Auth
+    'jwt': 'authenticates via',
+    'passport': 'authenticates via',
+    'sanctum': 'authenticates via',
+    'oauth': 'authenticates via',
+    'auth': 'authenticates via',
+    # Queues / workers
+    'kafka': 'publishes messages to',
+    'rabbitmq': 'publishes messages to',
+    'celery': 'enqueues tasks via',
+    'sqs': 'publishes messages to',
+    'bull': 'enqueues jobs via',
+    'beanstalkd': 'enqueues jobs via',
+    'horizon': 'manages queues via',
+    # Search
+    'elasticsearch': 'searches via',
+    'algolia': 'searches via',
+    'typesense': 'searches via',
+    'meilisearch': 'searches via',
+    'scout': 'searches via',
+    # Storage / CDN
+    's3': 'stores files in',
+    'cloudinary': 'stores media in',
+    'minio': 'stores files in',
+    'flysystem': 'stores files via',
+    # Monitoring / Logging
+    'sentry': 'reports errors to',
+    'datadog': 'sends metrics to',
+    'prometheus': 'exposes metrics for',
+    'grafana': 'visualizes in',
+    'bugsnag': 'reports errors to',
+    # Mail
+    'mailgun': 'sends email via',
+    'sendgrid': 'sends email via',
+    'smtp': 'sends email via',
+    'mailer': 'sends email via',
+    # Payment
+    'stripe': 'processes payments via',
+    'paypal': 'processes payments via',
+    'braintree': 'processes payments via',
+}
+
+
+def get_rel_label(dep: str) -> str:
+    return _REL_LABELS.get(dep.lower(), 'uses')
+
+
 def collect_external_deps(modules: dict, all_module_names: list) -> list:
     """Return top external deps sorted by usage frequency."""
     mod_set = {m.lower() for m in all_module_names}
@@ -482,13 +576,34 @@ def make_c4_context(modules: dict, project_name: str, all_module_names: list) ->
             lines.append(f'  System_Ext({alias}, "{dep}", "External dependency")')
     lines.append('')
     for dep in ext_deps:
-        lines.append(f'  Rel({proj}, {c4_alias(dep)}, "uses")')
+        label = get_rel_label(dep)
+        lines.append(f'  Rel({proj}, {c4_alias(dep)}, "{label}")')
     lines.append('```')
     return lines
 
 
+def detect_layer(mod: str, dp: Path, root: Path) -> str:
+    """Detect architectural layer: backend | frontend | module | admin | public | test."""
+    try:
+        parts = [p.lower() for p in dp.relative_to(root).parts]
+    except ValueError:
+        parts = [mod.lower()]
+    if any(p in ('nova-components', 'nova_components') for p in parts):
+        return 'admin'
+    if any(p == 'modules' for p in parts):
+        return 'module'
+    if any(p in ('resources', 'js', 'vue', 'react', 'assets', 'frontend', 'client') for p in parts):
+        return 'frontend'
+    if any(p in ('public', 'static', 'dist', 'build') for p in parts):
+        return 'public'
+    if any(p in ('test', 'tests', 'spec', 'specs', '__tests__', 'testing') for p in parts):
+        return 'test'
+    return 'backend'
+
+
 def make_c4_container(modules: dict, project_name: str, root: Path) -> list:
-    """Return lines for C4Container diagram (top-level modules only)."""
+    """Return lines for C4Container diagram grouped by architectural layer."""
+    # Collect modules at depth 0-2
     top: dict = {}
     for mod, data in modules.items():
         dp = data.get('dir_path')
@@ -502,28 +617,101 @@ def make_c4_container(modules: dict, project_name: str, root: Path) -> list:
     if not top:
         top = dict(list(modules.items())[:20])
 
-    proj = c4_alias(project_name)
-    lines = [
-        '```mermaid', 'C4Container',
-        f'  title Container diagram — {project_name}', '',
-        f'  System_Boundary({proj}, "{project_name}") {{',
-    ]
+    # Group by architectural layer
+    layers: dict = {
+        'backend': [], 'frontend': [], 'admin': [],
+        'module': [], 'public': [], 'test': [],
+    }
     for mod, data in top.items():
-        alias = c4_alias(mod)
-        label = mod.split('/')[-1]
-        tech = detect_tech(data.get('files', {}))
-        kw = data.get('keywords', [])[:3]
-        descr = c4_label(', '.join(kw)) if kw else label
-        ctype = module_container_type(mod)
-        lines.append(f'    {ctype}({alias}, "{label}", "{tech}", "{descr}")')
+        dp = data.get('dir_path', root)
+        layer = detect_layer(mod, dp, root)
+        layers.setdefault(layer, []).append((mod, data))
+
+    # Skip layers with no content
+    active_layers = {k: v for k, v in layers.items() if v}
+
+    proj = c4_alias(project_name)
+    lines = ['```mermaid', 'C4Container', f'  title Container diagram — {project_name}', '']
+
+    # User persona
+    lines.append(f'  Person(user, "User", "End-user of {project_name}")')
+    lines.append('')
+
+    # System boundary
+    lines.append(f'  System_Boundary({proj}, "{project_name}") {{')
+
+    alias_map: dict = {}  # mod → alias
+    layer_reps: dict = {}  # layer → first alias (for cross-layer rels)
+
+    layer_labels = {
+        'backend': 'Backend', 'frontend': 'Frontend',
+        'admin': 'Admin Panel', 'module': 'Modules',
+        'public': 'Public', 'test': 'Tests',
+    }
+
+    for layer, mods in active_layers.items():
+        if layer in ('test', 'public'):
+            continue
+        for mod, data in mods:
+            alias = c4_alias(mod)
+            alias_map[mod] = alias
+            if layer not in layer_reps:
+                layer_reps[layer] = alias
+            label = mod.split('/')[-1]
+            tech = detect_tech(data.get('files', {}))
+            kw = data.get('keywords', [])[:3]
+            descr = c4_label(', '.join(kw)) if kw else layer_labels.get(layer, label)
+            if layer == 'admin':
+                tech = f'{tech}/Nova'
+            ctype = module_container_type(mod)
+            lines.append(f'    {ctype}({alias}, "{label}", "{tech}", "{descr}")')
+
     lines.append('  }')
     lines.append('')
-    top_set = set(top)
+
+    # --- Relationships ---
+
+    # User → frontend or backend entry point
+    fe_rep = layer_reps.get('frontend')
+    be_rep = layer_reps.get('backend')
+    adm_rep = layer_reps.get('admin')
+
+    if fe_rep:
+        lines.append(f'  Rel(user, {fe_rep}, "accesses via browser")')
+    elif be_rep:
+        lines.append(f'  Rel(user, {be_rep}, "accesses via browser")')
+    if adm_rep and adm_rep != fe_rep:
+        lines.append(f'  Rel(user, {adm_rep}, "manages via admin")')
+
+    # Frontend → Backend (API)
+    if fe_rep and be_rep:
+        lines.append(f'  Rel({fe_rep}, {be_rep}, "API requests [HTTP/JSON]")')
+
+    # Admin → Backend
+    if adm_rep and be_rep:
+        lines.append(f'  Rel({adm_rep}, {be_rep}, "extends [Laravel Nova]")')
+
+    # Backend → Modules
+    mod_reps = [alias for mod, _ in active_layers.get('module', []) if mod in alias_map
+                for alias in [alias_map[mod]]]
+    if be_rep and mod_reps:
+        for m_alias in mod_reps[:5]:
+            lines.append(f'  Rel({be_rep}, {m_alias}, "delegates to")')
+
+    # Dep-based relationships (same-layer)
+    added_rels: set = set()
     for mod, data in top.items():
-        src = c4_alias(mod)
+        if mod not in alias_map:
+            continue
+        src = alias_map[mod]
         for dep in data.get('deps', []):
-            if dep in top_set:
-                lines.append(f'  Rel({src}, {c4_alias(dep)}, "uses")')
+            if dep in alias_map:
+                dst = alias_map[dep]
+                key = (src, dst)
+                if key not in added_rels and src != dst:
+                    added_rels.add(key)
+                    lines.append(f'  Rel({src}, {dst}, "uses")')
+
     lines.append('```')
     return lines
 
@@ -559,9 +747,30 @@ def make_c4_component(mod: str, files_data: dict) -> list:
     lines.append('')
 
     added: set = set()
+    # Build base-name → alias lookup for import matching
+    base_to_alias: dict = {}
     for fname, alias in file_aliases.items():
+        base = re.sub(r'\.(py|go|ts|js|tsx|jsx)$', '', fname).lower()
+        base_to_alias[base] = alias
+        base_to_alias[base.split('/')[-1]] = alias
+
+    for fname, alias in file_aliases.items():
+        fd = files_data[fname]
+
+        # 1. Import-based relationships (most reliable)
+        for imp in fd.get('imports', []):
+            imp_base = re.sub(r'\.(ts|tsx|js|jsx|py|go)$', '', imp.split('/')[-1]).lower()
+            if imp_base in base_to_alias:
+                other_alias = base_to_alias[imp_base]
+                if other_alias != alias:
+                    key = (alias, other_alias)
+                    if key not in added:
+                        added.add(key)
+                        lines.append(f'  Rel({alias}, {other_alias}, "imports")')
+
+        # 2. Call-based relationships (fallback)
         all_calls: set = set()
-        for fn in files_data[fname].get('functions', []):
+        for fn in fd.get('functions', []):
             all_calls.update(fn.get('calls', []))
         for other_fname, other_alias in file_aliases.items():
             if other_fname == fname:
@@ -667,9 +876,13 @@ def make_context_md(dir_path: Path, root: Path, all_modules: list, reverse_deps:
         tags.add(base)
     for fd in files_data.values():
         for fn in fd.get('functions', [])[:3]:
-            tags.add(fn['name'].lower())
+            name = fn['name'].lower()
+            # Skip obfuscated/minified names (1-2 chars, or pure digits, or single-letter+digit)
+            if len(name) >= 3 and not re.match(r'^[a-z]{1,2}\d*$', name):
+                tags.add(name)
 
-    lines.append(f"**tags:** {' '.join(sorted(tags)[:16])}")
+    meaningful_tags = sorted(t for t in tags if len(t) >= 3)[:16]
+    lines.append(f"**tags:** {' '.join(meaningful_tags)}")
     lines.append(f"**updated:** {now} ndoc")
 
     # C4 Component diagram
@@ -1075,6 +1288,537 @@ def ndoc_status(project_path: str = "") -> str:
             out.append("  ...")
     else:
         out.append("\n💡 Запусти ndoc_init для инициализации")
+
+    return '\n'.join(out)
+
+
+import json as _json
+
+
+# ─────────────────────────────────────────────
+# AGENT FINDINGS → C4 GENERATORS
+# ─────────────────────────────────────────────
+
+def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
+    """Generate C4Context from agent findings JSON."""
+    proj = c4_alias(project_name)
+    layers = findings.get('layers', [])
+    techs = [l.get('tech', '') for l in layers if l.get('tech')]
+    main_tech = techs[0] if techs else 'Application'
+
+    # Collect external deps with labels
+    ext_deps: dict = {}
+    for layer in layers:
+        for dep in layer.get('external_deps', []):
+            name = dep.get('name', '').strip()
+            if name and len(name) >= 2:
+                ext_deps[name] = {
+                    'type': dep.get('type', 'other'),
+                    'label': dep.get('label') or get_rel_label(name),
+                }
+
+    _DB = {'database'}
+    _QUEUE = {'queue', 'broker'}
+
+    lines = [
+        '```mermaid', 'C4Context',
+        f'  title System Context — {project_name}', '',
+        f'  Person(user, "User", "End-user of {project_name}")',
+        f'  System({proj}, "{project_name}", "{main_tech} application")',
+        '',
+    ]
+    for name, info in list(ext_deps.items())[:12]:
+        alias = c4_alias(name)
+        dep_type = info['type']
+        if dep_type in _DB:
+            lines.append(f'  SystemDb_Ext({alias}, "{name}", "Database")')
+        elif dep_type in _QUEUE:
+            lines.append(f'  SystemQueue_Ext({alias}, "{name}", "Message broker")')
+        else:
+            lines.append(f'  System_Ext({alias}, "{name}", "External system")')
+    lines.append('')
+    lines.append(f'  Rel(user, {proj}, "uses")')
+    for name, info in list(ext_deps.items())[:12]:
+        lines.append(f'  Rel({proj}, {c4_alias(name)}, "{info["label"]}")')
+    lines.append('```')
+    return lines
+
+
+def make_c4_container_from_findings(findings: dict, project_name: str) -> list:
+    """Generate C4Container from agent findings JSON."""
+    proj = c4_alias(project_name)
+    layers = findings.get('layers', [])
+    modules = findings.get('modules', [])
+    cross_rels = findings.get('cross_layer_relations', [])
+
+    lines = ['```mermaid', 'C4Container', f'  title Container diagram — {project_name}', '']
+    lines.append(f'  Person(user, "User", "End-user of {project_name}")')
+    lines.append('')
+    lines.append(f'  System_Boundary({proj}, "{project_name}") {{')
+
+    alias_map: dict = {}
+
+    for layer in layers:
+        name = layer.get('name', 'Unknown')
+        alias = c4_alias(name)
+        alias_map[name] = alias
+        tech = layer.get('tech', 'Code')
+        desc = c4_label(layer.get('description', name))
+        name_lower = name.lower()
+        if any(k in name_lower for k in ('db', 'database', 'redis', 'mongo', 'store')):
+            ctype = 'ContainerDb'
+        elif any(k in name_lower for k in ('queue', 'worker', 'broker')):
+            ctype = 'ContainerQueue'
+        else:
+            ctype = 'Container'
+        lines.append(f'    {ctype}({alias}, "{name}", "{tech}", "{desc}")')
+
+    for mod in modules[:6]:
+        mod_name = mod.get('name', '')
+        if not mod_name:
+            continue
+        alias = c4_alias(mod_name)
+        alias_map[mod_name] = alias
+        desc = c4_label(mod.get('description', mod_name))
+        lines.append(f'    Container({alias}, "{mod_name}", "Module", "{desc}")')
+
+    lines.append('  }')
+    lines.append('')
+
+    # User → entry points
+    fe = next((l for l in layers if any(k in l.get('name','').lower() for k in ('front','vue','react','js','ui','browser'))), None)
+    be = next((l for l in layers if any(k in l.get('name','').lower() for k in ('back','api','server','php','laravel','django','rails'))), None)
+    adm = next((l for l in layers if any(k in l.get('name','').lower() for k in ('admin','nova','panel'))), None)
+
+    if fe and fe['name'] in alias_map:
+        lines.append(f'  Rel(user, {alias_map[fe["name"]]}, "accesses via browser")')
+    elif be and be['name'] in alias_map:
+        lines.append(f'  Rel(user, {alias_map[be["name"]]}, "accesses via browser")')
+    if adm and adm['name'] in alias_map and adm != fe:
+        lines.append(f'  Rel(user, {alias_map[adm["name"]]}, "manages via admin panel")')
+
+    # Explicit cross-layer relations from agent findings
+    for rel in cross_rels:
+        src = rel.get('from', '')
+        dst = rel.get('to', '')
+        label = rel.get('label', 'uses')
+        if src in alias_map and dst in alias_map:
+            lines.append(f'  Rel({alias_map[src]}, {alias_map[dst]}, "{label}")')
+
+    # Backend → Modules
+    if be and modules:
+        be_alias = alias_map.get(be['name'])
+        for mod in modules[:5]:
+            mod_alias = alias_map.get(mod.get('name', ''))
+            if be_alias and mod_alias:
+                lines.append(f'  Rel({be_alias}, {mod_alias}, "delegates to")')
+
+    # Module inter-dependencies
+    for mod in modules:
+        mod_name = mod.get('name', '')
+        for dep in mod.get('depends_on', []):
+            if mod_name in alias_map and dep in alias_map:
+                lines.append(f'  Rel({alias_map[mod_name]}, {alias_map[dep]}, "uses")')
+
+    lines.append('```')
+    return lines
+
+
+def detect_project_layers(root: Path) -> list:
+    """Quick scan to detect architectural layers for agent prompts."""
+    layers = []
+
+    # Backend: composer.json present → Laravel/PHP
+    if (root / 'composer.json').exists():
+        try:
+            composer = _json.loads((root / 'composer.json').read_text(encoding='utf-8'))
+            framework = ''
+            for pkg in composer.get('require', {}):
+                if 'laravel/framework' in pkg:
+                    framework = 'Laravel'
+                    break
+                elif 'symfony' in pkg:
+                    framework = 'Symfony'
+                    break
+        except Exception:
+            framework = 'PHP'
+        tech = f'PHP/{framework}' if framework else 'PHP'
+        paths = []
+        for d in ['app', 'routes', 'config', 'database']:
+            if (root / d).exists():
+                paths.append(str(root / d))
+        paths.append(str(root / 'composer.json'))
+        layers.append({
+            'name': 'Backend',
+            'path': ', '.join(paths[:3]),
+            'tech': tech,
+            'agent_prompt': (
+                f"You are studying the BACKEND layer of project '{root.name}' at: {root}\n\n"
+                f"Your tasks:\n"
+                f"1. Read composer.json — list ALL external dependencies with their purpose\n"
+                f"2. Explore app/ structure: Controllers, Services, Models, Repositories, Providers\n"
+                f"3. Read routes/ — list main API/web endpoints grouped by domain\n"
+                f"4. Identify what each app layer does and how they interact\n"
+                f"5. Find: database type (MySQL/Postgres/etc), cache (Redis?), queue driver\n\n"
+                f"Return a JSON object with these fields:\n"
+                f"  tech, description, key_components[], "
+                f"external_deps[{{name, type, label}}], api_endpoints[]"
+            ),
+        })
+
+    # Frontend: resources/js or src/
+    for fe_path in [root / 'resources' / 'js', root / 'src', root / 'frontend']:
+        if fe_path.exists() and any(fe_path.rglob('*.vue')) or any(fe_path.rglob('*.ts') if fe_path.exists() else []):
+            pkg_path = root / 'package.json'
+            layers.append({
+                'name': 'Frontend',
+                'path': str(fe_path),
+                'tech': 'Vue.js/JavaScript',
+                'agent_prompt': (
+                    f"You are studying the FRONTEND layer of project '{root.name}' at: {fe_path}\n\n"
+                    f"Your tasks:\n"
+                    f"1. Read {pkg_path} — list key dependencies (Vue, Axios, Vuex/Pinia, etc)\n"
+                    f"2. Explore the components structure — group by feature/domain\n"
+                    f"3. Find all API calls (axios/fetch) — what endpoints are called and why\n"
+                    f"4. Find state management setup (Vuex/Pinia stores)\n"
+                    f"5. Find routing configuration\n\n"
+                    f"Return a JSON object with these fields:\n"
+                    f"  tech, description, key_components[], "
+                    f"external_deps[{{name, type, label}}], api_calls[]"
+                ),
+            })
+            break
+
+    # Nova Admin Panel
+    nova_path = root / 'nova-components'
+    if nova_path.exists():
+        components = [d.name for d in nova_path.iterdir() if d.is_dir()]
+        layers.append({
+            'name': 'Admin Panel',
+            'path': str(nova_path),
+            'tech': 'Laravel Nova/Vue.js',
+            'agent_prompt': (
+                f"You are studying the ADMIN PANEL (Laravel Nova) of project '{root.name}' at: {nova_path}\n\n"
+                f"Components found: {', '.join(components[:15])}\n\n"
+                f"For each component:\n"
+                f"1. Read its resources/js/ files — understand what it does\n"
+                f"2. Find props, events, and key functions\n"
+                f"3. Find dependencies between components (cross-imports)\n"
+                f"4. Identify what backend resources/models each component interacts with\n\n"
+                f"Return a JSON object with these fields:\n"
+                f"  tech, description, "
+                f"key_components[{{name, purpose, dependencies[]}}], "
+                f"external_deps[{{name, type, label}}]"
+            ),
+        })
+
+    # Modules (bounded contexts)
+    modules_path = root / 'Modules'
+    if modules_path.exists():
+        mod_names = [d.name for d in modules_path.iterdir() if d.is_dir()]
+        layers.append({
+            'name': 'Modules',
+            'path': str(modules_path),
+            'tech': 'PHP/Laravel Modules',
+            'agent_prompt': (
+                f"You are studying the LARAVEL MODULES (bounded contexts) of project '{root.name}' at: {modules_path}\n\n"
+                f"Modules found: {', '.join(mod_names)}\n\n"
+                f"For each module:\n"
+                f"1. Read Routes/, Http/Controllers/, Models/ — what business domain does it serve\n"
+                f"2. Find cross-module dependencies (service calls, shared models, events)\n"
+                f"3. Identify what events/jobs it produces or consumes\n"
+                f"4. Find its public API (routes, service classes exposed to other modules)\n\n"
+                f"Return a JSON object with a 'modules' array, each item:\n"
+                f"  {{name, description, domain, depends_on[], provides[]}}"
+            ),
+        })
+
+    return layers
+
+
+# ─────────────────────────────────────────────
+# NEW MCP TOOLS
+# ─────────────────────────────────────────────
+
+@mcp.tool()
+def ndoc_explore(project_path: str = "") -> str:
+    """
+    Scans project structure and returns instructions to launch an Agent Team.
+    Each agent studies its own architectural layer in parallel.
+    After all agents finish — call ndoc_generate with their combined findings.
+    """
+    root = resolve_path(project_path)
+    if not root.exists():
+        return f"Error: folder not found: {project_path}"
+
+    layers = detect_project_layers(root)
+    if not layers:
+        return (
+            f"Warning: no architectural layers detected in {root}.\n"
+            f"Use ndoc_init for basic initialization."
+        )
+
+    n = len(layers)
+    out = [
+        f"NeuroDoc Explorer — {root.name}",
+        "=" * 52,
+        "",
+        f"Detected {n} architectural layers:",
+    ]
+    for layer in layers:
+        out.append(f"  • {layer['name']} ({layer['tech']}): {layer['path']}")
+
+    out += [
+        "",
+        "=" * 52,
+        "",
+        "INSTRUCTION: Create an Agent Team to deeply analyze this project.",
+        "",
+        f"Spawn {n} teammates in parallel — one per architectural layer.",
+        "Each teammate independently studies its layer and returns a JSON report.",
+        "",
+    ]
+
+    for i, layer in enumerate(layers, 1):
+        out.append("-" * 44)
+        out.append(f"Teammate {i} — {layer['name']} ({layer['tech']})")
+        out.append("")
+        out.append(layer['agent_prompt'])
+        out.append("")
+
+    out += [
+        "=" * 52,
+        "",
+        "After ALL teammates finish — collect their JSON reports and call:",
+        "",
+        f'  ndoc_generate(',
+        f'    project_path="{root}",',
+        f'    findings=<combined JSON string from all agents>',
+        f'  )',
+        "",
+        "Expected findings JSON structure:",
+        "```json",
+        _json.dumps({
+            "project": root.name,
+            "architecture_type": "e.g. Laravel+Vue+Nova | Django+React | NestJS+Next.js",
+            "layers": [
+                {
+                    "name": "layer name",
+                    "path": "path/to/layer",
+                    "tech": "technology stack",
+                    "description": "what this layer does",
+                    "key_components": ["ComponentA", "ServiceB"],
+                    "external_deps": [
+                        {
+                            "name": "library-name",
+                            "type": "database|cache|queue|http|auth|mail|payment|monitoring|other",
+                            "label": "relationship description, e.g. reads/writes data"
+                        }
+                    ],
+                }
+            ],
+            "modules": [
+                {
+                    "name": "ModuleName",
+                    "description": "business purpose",
+                    "domain": "domain name",
+                    "depends_on": ["OtherModule"]
+                }
+            ],
+            "cross_layer_relations": [
+                {
+                    "from": "Frontend",
+                    "to": "Backend",
+                    "label": "API requests [HTTP/JSON]"
+                }
+            ],
+        }, ensure_ascii=False, indent=2),
+        "```",
+    ]
+
+    return '\n'.join(out)
+
+
+@mcp.tool()
+def ndoc_generate(project_path: str = "", findings: str = "") -> str:
+    """
+    Generates context.md files and C4 diagrams based on Agent Team findings.
+    findings: JSON string with architectural description from agents (output of ndoc_explore flow).
+    If findings is empty — use ndoc_init for basic initialization instead.
+    """
+    root = resolve_path(project_path)
+    if not root.exists():
+        return f"Error: folder not found: {project_path}"
+
+    if not findings.strip():
+        return (
+            "Warning: findings is empty. First run ndoc_explore and spawn the Agent Team.\n"
+            "Or use ndoc_init for basic initialization without agents."
+        )
+
+    # Parse findings
+    try:
+        data = _json.loads(findings)
+    except _json.JSONDecodeError as e:
+        return f"❌ Ошибка парсинга findings JSON: {e}"
+
+    project_name = data.get('project', root.name)
+    out = [f"NeuroDoc Generate — {project_name}", "=" * 52, ""]
+
+    # ── Step 1: Static scan (for per-directory context.md) ──
+    out.append("Step 1/4 — Static scan...")
+    dirs_with_code = []
+    all_dirs = set()
+    for dp, subdirs, files in os.walk(root):
+        subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+        dp = Path(dp)
+        if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files):
+            dirs_with_code.append(dp)
+            parent = dp.parent
+            while parent != root.parent:
+                all_dirs.add(parent)
+                parent = parent.parent
+    all_dirs.update(dirs_with_code)
+    all_dirs.add(root)
+
+    all_module_names = [short_name(d, root) for d in all_dirs]
+    modules: dict = {}
+    for dp in sorted(all_dirs):
+        mod = short_name(dp, root)
+        fd_map = scan_dir(dp)
+        all_imp, kw = [], []
+        for fd in fd_map.values():
+            all_imp.extend(fd.get('imports', []))
+            kw.extend([fn['name'] for fn in fd.get('functions', [])[:2]])
+        deps = resolve_deps(all_imp, [m for m in all_module_names if m != mod])
+        modules[mod] = {'dir_path': dp, 'files': fd_map, 'deps': deps, 'keywords': kw[:4]}
+
+    out.append(f"   ok: {len(all_dirs)} directories, {len(dirs_with_code)} contain code")
+
+    # ── Step 2: Generate per-directory context.md ──
+    out.append("\nStep 2/4 — Generating context.md files...")
+    reverse_deps: dict = {}
+    for mod, mdata in modules.items():
+        for dep in mdata.get('deps', []):
+            reverse_deps.setdefault(dep, []).append(mod)
+
+    generated = 0
+    for mod, mdata in modules.items():
+        dp = mdata['dir_path']
+        content = make_context_md(dp, root, all_module_names, reverse_deps)
+        (dp / 'context.md').write_text(content, encoding='utf-8')
+        generated += 1
+    out.append(f"   ok: {generated} context.md files written")
+
+    # ── Step 3: Build enriched index with agent findings ──
+    out.append("\nStep 3/4 — Building context.index.md with C4 diagrams...")
+    now = datetime.now().strftime('%Y-%m-%d')
+    arch_type = data.get('architecture_type', '')
+    layers_info = data.get('layers', [])
+    cross_rels = data.get('cross_layer_relations', [])
+
+    index_lines = [
+        f"# Project: {project_name} | modules: {len(modules)} | updated: {now}",
+        "",
+    ]
+    if arch_type:
+        index_lines.append(f"**architecture:** {arch_type}")
+        index_lines.append("")
+
+    # Architecture overview from agent findings
+    if layers_info:
+        index_lines.append("## Architecture Overview")
+        for layer in layers_info:
+            desc = layer.get('description', '')
+            tech = layer.get('tech', '')
+            name = layer.get('name', '')
+            kc = layer.get('key_components', [])[:4]
+            line = f"**{name}** ({tech})"
+            if desc:
+                line += f": {desc}"
+            if kc:
+                line += f" | {', '.join(kc)}"
+            index_lines.append(line)
+        index_lines.append("")
+
+    # Module descriptions from agent findings
+    found_modules = data.get('modules', [])
+    if found_modules:
+        index_lines.append("## Modules")
+        for mod in found_modules:
+            name = mod.get('name', '')
+            desc = mod.get('description', '')
+            domain = mod.get('domain', '')
+            deps = mod.get('depends_on', [])
+            line = f"**{name}**"
+            if domain:
+                line += f" [{domain}]"
+            if desc:
+                line += f": {desc}"
+            if deps:
+                line += f" → {', '.join(deps)}"
+            index_lines.append(line)
+        index_lines.append("")
+
+    # Standard map
+    index_lines.append("## Map")
+    for mod, mdata in modules.items():
+        deps = mdata.get('deps', [])
+        kw = mdata.get('keywords', [])[:4]
+        dep_str = ', '.join(deps) if deps else '(none)'
+        line = f"{mod} → {dep_str}"
+        if kw:
+            line += f" | {', '.join(kw)}"
+        index_lines.append(line)
+    index_lines.append("")
+
+    # C4 Context (from agent findings)
+    index_lines.append("## C4 Context")
+    index_lines.append("")
+    if layers_info:
+        index_lines += make_c4_context_from_findings(data, project_name)
+    else:
+        index_lines += make_c4_context(modules, project_name, all_module_names)
+    index_lines.append("")
+
+    # C4 Container (from agent findings)
+    index_lines.append("## C4 Container")
+    index_lines.append("")
+    if layers_info:
+        index_lines += make_c4_container_from_findings(data, project_name)
+    else:
+        index_lines += make_c4_container(modules, project_name, root)
+
+    (root / 'context.index.md').write_text('\n'.join(index_lines), encoding='utf-8')
+    out.append("   ok: context.index.md written with C4 Context + C4 Container from agent findings")
+
+    # ── Step 4: Update CLAUDE.md ──
+    out.append("\nStep 4/4 — Updating CLAUDE.md...")
+    claude_path = root / 'CLAUDE.md'
+    if claude_path.exists():
+        existing = claude_path.read_text(encoding='utf-8')
+        if 'NeuroDoc' not in existing:
+            claude_path.write_text(existing + CLAUDE_MD_RULES, encoding='utf-8')
+            out.append("   ok: NeuroDoc rules added to existing CLAUDE.md")
+        else:
+            out.append("   info: CLAUDE.md already contains NeuroDoc rules")
+    else:
+        claude_path.write_text(f"# {project_name}\n{CLAUDE_MD_RULES}", encoding='utf-8')
+        out.append("   ok: CLAUDE.md created")
+
+    out += [
+        "",
+        "=" * 52,
+        "NeuroDoc Generate complete!",
+        "",
+        f"   {generated} context.md files",
+        f"   context.index.md with C4 Context + C4 Container",
+        f"   C4 diagrams built from Agent Team findings",
+        f"   CLAUDE.md updated",
+    ]
+
+    if cross_rels:
+        out.append(f"   {len(cross_rels)} cross-layer relationships from agent findings")
 
     return '\n'.join(out)
 
