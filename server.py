@@ -1424,112 +1424,313 @@ def make_c4_container_from_findings(findings: dict, project_name: str) -> list:
     return lines
 
 
-def detect_project_layers(root: Path) -> list:
-    """Quick scan to detect architectural layers for agent prompts."""
-    layers = []
+def _search(root: Path, names: list, max_depth: int = 2) -> Path | None:
+    """Find first matching file/dir within max_depth levels."""
+    for name in names:
+        if (root / name).exists():
+            return root / name
+    if max_depth > 1:
+        for child in root.iterdir():
+            if child.is_dir() and child.name not in SKIP_DIRS:
+                for name in names:
+                    if (child / name).exists():
+                        return child / name
+    return None
 
-    # Backend: composer.json present → Laravel/PHP
-    if (root / 'composer.json').exists():
+
+def _subdirs(path: Path) -> list:
+    try:
+        return [d.name for d in path.iterdir() if d.is_dir() and d.name not in SKIP_DIRS]
+    except Exception:
+        return []
+
+
+def detect_project_layers(root: Path) -> list:
+    """Detect architectural layers for any tech stack."""
+    layers = []
+    seen_paths: set = set()
+
+    def add_layer(name, path, tech, prompt):
+        p = str(path)
+        if p not in seen_paths:
+            seen_paths.add(p)
+            layers.append({'name': name, 'path': p, 'tech': tech, 'agent_prompt': prompt})
+
+    # ── Go ──
+    go_mod = _search(root, ['go.mod'])
+    if go_mod:
+        go_root = go_mod.parent
         try:
-            composer = _json.loads((root / 'composer.json').read_text(encoding='utf-8'))
-            framework = ''
-            for pkg in composer.get('require', {}):
-                if 'laravel/framework' in pkg:
-                    framework = 'Laravel'
-                    break
-                elif 'symfony' in pkg:
-                    framework = 'Symfony'
-                    break
+            mod_line = next((l for l in go_mod.read_text(encoding='utf-8').splitlines() if l.startswith('module ')), '')
+            mod_name = mod_line.replace('module ', '').strip()
+        except Exception:
+            mod_name = go_root.name
+        subs = _subdirs(go_root)
+        has_grpc = any(d in subs for d in ('proto', 'gen', 'grpc', 'pb'))
+        tech = 'Go/gRPC' if has_grpc else 'Go'
+        add_layer('Backend', go_root, tech,
+            f"You are studying the Go backend of '{root.name}' at: {go_root}\n"
+            f"Module: {mod_name} | Dirs: {', '.join(subs[:15])}\n\n"
+            f"Tasks:\n"
+            f"1. Read go.mod — list ALL dependencies with their purpose\n"
+            f"2. Explore cmd/ — what services/binaries are defined\n"
+            f"3. Explore internal/, pkg/ — map packages: handlers, services, repositories, models\n"
+            f"4. Find API layer: HTTP routes or gRPC services\n"
+            f"5. Find: DB driver, cache, queue, external HTTP clients\n"
+            f"6. Map cross-package data flow\n\n"
+            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+        )
+        for proto_dir in ('proto', 'gen', 'pb'):
+            if (go_root / proto_dir).exists():
+                add_layer('gRPC / Protobuf', go_root / proto_dir, 'gRPC/Protobuf',
+                    f"Study the gRPC/Protobuf layer of '{root.name}' at: {go_root / proto_dir}\n\n"
+                    f"Tasks:\n"
+                    f"1. List all .proto files — services and messages defined\n"
+                    f"2. For each service: list RPC methods with request/response types\n"
+                    f"3. Find generated code — what clients/servers are generated\n"
+                    f"4. Identify cross-service dependencies\n\n"
+                    f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}]"
+                )
+                break
+
+    # ── PHP / Laravel / Symfony ──
+    composer = _search(root, ['composer.json'])
+    if composer:
+        php_root = composer.parent
+        try:
+            data = _json.loads(composer.read_text(encoding='utf-8'))
+            reqs = data.get('require', {})
+            framework = 'Laravel' if any('laravel/framework' in k for k in reqs) \
+                else 'Symfony' if any('symfony' in k for k in reqs) \
+                else 'PHP'
         except Exception:
             framework = 'PHP'
-        tech = f'PHP/{framework}' if framework else 'PHP'
-        paths = []
-        for d in ['app', 'routes', 'config', 'database']:
-            if (root / d).exists():
-                paths.append(str(root / d))
-        paths.append(str(root / 'composer.json'))
-        layers.append({
-            'name': 'Backend',
-            'path': ', '.join(paths[:3]),
-            'tech': tech,
-            'agent_prompt': (
-                f"You are studying the BACKEND layer of project '{root.name}' at: {root}\n\n"
-                f"Your tasks:\n"
-                f"1. Read composer.json — list ALL external dependencies with their purpose\n"
-                f"2. Explore app/ structure: Controllers, Services, Models, Repositories, Providers\n"
-                f"3. Read routes/ — list main API/web endpoints grouped by domain\n"
-                f"4. Identify what each app layer does and how they interact\n"
-                f"5. Find: database type (MySQL/Postgres/etc), cache (Redis?), queue driver\n\n"
-                f"Return a JSON object with these fields:\n"
-                f"  tech, description, key_components[], "
-                f"external_deps[{{name, type, label}}], api_endpoints[]"
-            ),
-        })
+        subs = _subdirs(php_root)
+        add_layer('Backend', php_root, f'PHP/{framework}',
+            f"Study the {framework} backend of '{root.name}' at: {php_root}\n\n"
+            f"Tasks:\n"
+            f"1. Read composer.json — list ALL dependencies with their purpose\n"
+            f"2. Explore app/ — Controllers, Services, Models, Repositories, Providers\n"
+            f"3. Read routes/ — list API/web endpoints grouped by domain\n"
+            f"4. Find: DB type, cache (Redis?), queue driver, external APIs\n"
+            f"5. Map layer interactions\n\n"
+            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+        )
+        # Laravel Nova
+        nova_path = php_root / 'nova-components'
+        if nova_path.exists():
+            components = [d.name for d in nova_path.iterdir() if d.is_dir()]
+            add_layer('Admin Panel', nova_path, 'Laravel Nova/Vue.js',
+                f"Study the Nova admin panel of '{root.name}' at: {nova_path}\n"
+                f"Components: {', '.join(components[:15])}\n\n"
+                f"Tasks:\n"
+                f"1. For each component — read resources/js/ files, understand its purpose\n"
+                f"2. Find props, events, key functions\n"
+                f"3. Find cross-component dependencies (imports)\n"
+                f"4. Identify what backend models each component interacts with\n\n"
+                f"Return JSON: tech, description, key_components[{{name,purpose,dependencies[]}}], external_deps[{{name,type,label}}]"
+            )
+        # Laravel Modules
+        modules_path = php_root / 'Modules'
+        if modules_path.exists():
+            mod_names = [d.name for d in modules_path.iterdir() if d.is_dir()]
+            add_layer('Modules', modules_path, 'PHP/Laravel Modules',
+                f"Study the Laravel modules (bounded contexts) of '{root.name}' at: {modules_path}\n"
+                f"Modules: {', '.join(mod_names)}\n\n"
+                f"Tasks:\n"
+                f"1. For each module — Routes/, Controllers/, Models/ — what domain does it serve\n"
+                f"2. Find cross-module dependencies\n"
+                f"3. Identify events/jobs produced or consumed\n"
+                f"4. Find public API exposed to other modules\n\n"
+                f"Return JSON: modules[{{name, description, domain, depends_on[], provides[]}}]"
+            )
 
-    # Frontend: resources/js or src/
-    for fe_path in [root / 'resources' / 'js', root / 'src', root / 'frontend']:
-        if fe_path.exists() and any(fe_path.rglob('*.vue')) or any(fe_path.rglob('*.ts') if fe_path.exists() else []):
-            pkg_path = root / 'package.json'
-            layers.append({
-                'name': 'Frontend',
-                'path': str(fe_path),
-                'tech': 'Vue.js/JavaScript',
-                'agent_prompt': (
-                    f"You are studying the FRONTEND layer of project '{root.name}' at: {fe_path}\n\n"
-                    f"Your tasks:\n"
-                    f"1. Read {pkg_path} — list key dependencies (Vue, Axios, Vuex/Pinia, etc)\n"
-                    f"2. Explore the components structure — group by feature/domain\n"
-                    f"3. Find all API calls (axios/fetch) — what endpoints are called and why\n"
-                    f"4. Find state management setup (Vuex/Pinia stores)\n"
-                    f"5. Find routing configuration\n\n"
-                    f"Return a JSON object with these fields:\n"
-                    f"  tech, description, key_components[], "
-                    f"external_deps[{{name, type, label}}], api_calls[]"
-                ),
-            })
+    # ── Python ──
+    py_marker = _search(root, ['pyproject.toml', 'requirements.txt', 'setup.py', 'Pipfile', 'poetry.lock'])
+    if py_marker:
+        py_root = py_marker.parent
+        subs = _subdirs(py_root)
+        framework = 'FastAPI' if any(s in subs for s in ('routers', 'api')) \
+            else 'Django' if any(s in subs for s in ('urls.py',)) or (py_root / 'manage.py').exists() \
+            else 'Flask' if any(s in subs for s in ('blueprints',)) \
+            else 'Python'
+        add_layer('Backend', py_root, f'Python/{framework}',
+            f"Study the Python/{framework} backend of '{root.name}' at: {py_root}\n"
+            f"Dirs: {', '.join(subs[:15])}\n\n"
+            f"Tasks:\n"
+            f"1. Read pyproject.toml or requirements.txt — list ALL dependencies with their purpose\n"
+            f"2. Explore source directories — map modules: routers/views, services, models, schemas\n"
+            f"3. Find API endpoints (FastAPI routes, Django urls, Flask blueprints)\n"
+            f"4. Find: DB (SQLAlchemy/Django ORM/etc), cache, queue (Celery?), external HTTP clients\n"
+            f"5. Map data flow between layers\n\n"
+            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+        )
+
+    # ── Node.js / TypeScript ──
+    pkg_json = _search(root, ['package.json'])
+    if pkg_json and not composer:  # skip if already handled as frontend of PHP project
+        pkg_root = pkg_json.parent
+        try:
+            data = _json.loads(pkg_json.read_text(encoding='utf-8'))
+            deps = {**data.get('dependencies', {}), **data.get('devDependencies', {})}
+            framework = 'Next.js' if 'next' in deps \
+                else 'NestJS' if '@nestjs/core' in deps \
+                else 'Express' if 'express' in deps \
+                else 'React' if 'react' in deps \
+                else 'Vue' if 'vue' in deps \
+                else 'Node.js'
+        except Exception:
+            framework = 'Node.js'
+            deps = {}
+        subs = _subdirs(pkg_root)
+        has_src = (pkg_root / 'src').exists()
+        is_frontend = framework in ('React', 'Vue', 'Next.js') and not any(
+            d in subs for d in ('controllers', 'services', 'handlers', 'routes'))
+        layer_name = 'Frontend' if is_frontend else 'Backend'
+        add_layer(layer_name, pkg_root, f'TypeScript/{framework}' if (pkg_root / 'tsconfig.json').exists() else framework,
+            f"Study the {framework} {'frontend' if is_frontend else 'backend'} of '{root.name}' at: {pkg_root}\n"
+            f"Dirs: {', '.join(subs[:15])}\n\n"
+            f"Tasks:\n"
+            f"1. Read package.json — list ALL dependencies with their purpose\n"
+            f"2. Explore src/ — map modules: {'components, pages, hooks, stores' if is_frontend else 'controllers, services, repositories, modules'}\n"
+            f"3. Find {'API calls (axios/fetch) — what endpoints are called' if is_frontend else 'API routes/endpoints grouped by domain'}\n"
+            f"4. Find: {'state management (Redux/Zustand/Pinia)' if is_frontend else 'DB driver, cache, queue, external APIs'}\n"
+            f"5. Map cross-module dependencies\n\n"
+            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], {'api_calls[]' if is_frontend else 'api_endpoints[]'}"
+        )
+
+    # ── Java / Kotlin / Spring ──
+    java_marker = _search(root, ['pom.xml', 'build.gradle', 'build.gradle.kts'])
+    if java_marker:
+        java_root = java_marker.parent
+        is_kotlin = java_marker.name.endswith('.kts') or any((java_root / 'src').rglob('*.kt'))
+        tech = 'Kotlin/Spring' if is_kotlin else 'Java/Spring'
+        subs = _subdirs(java_root)
+        add_layer('Backend', java_root, tech,
+            f"Study the {tech} backend of '{root.name}' at: {java_root}\n"
+            f"Dirs: {', '.join(subs[:15])}\n\n"
+            f"Tasks:\n"
+            f"1. Read pom.xml or build.gradle — list ALL dependencies with their purpose\n"
+            f"2. Explore src/main/ — map packages: controllers, services, repositories, models, config\n"
+            f"3. Find REST endpoints (@RestController, @GetMapping etc)\n"
+            f"4. Find: DB (JPA/Hibernate/JDBC), cache (Redis?), queue (Kafka/RabbitMQ?), external clients\n"
+            f"5. Map Spring beans and their relationships\n\n"
+            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+        )
+
+    # ── Rust ──
+    cargo = _search(root, ['Cargo.toml'])
+    if cargo:
+        rust_root = cargo.parent
+        subs = _subdirs(rust_root)
+        add_layer('Backend', rust_root, 'Rust',
+            f"Study the Rust project '{root.name}' at: {rust_root}\n"
+            f"Dirs: {', '.join(subs[:15])}\n\n"
+            f"Tasks:\n"
+            f"1. Read Cargo.toml — list ALL dependencies with their purpose\n"
+            f"2. Explore src/ — map modules: handlers, services, models, db, config\n"
+            f"3. Find API layer (Axum/Actix/Warp routes)\n"
+            f"4. Find: DB (sqlx/diesel/sea-orm), cache, queue, external HTTP clients\n"
+            f"5. Map module dependencies\n\n"
+            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+        )
+
+    # ── Ruby / Rails ──
+    gemfile = _search(root, ['Gemfile'])
+    if gemfile:
+        ruby_root = gemfile.parent
+        subs = _subdirs(ruby_root)
+        framework = 'Rails' if (ruby_root / 'config' / 'routes.rb').exists() else 'Ruby'
+        add_layer('Backend', ruby_root, f'Ruby/{framework}',
+            f"Study the Ruby/{framework} backend of '{root.name}' at: {ruby_root}\n"
+            f"Dirs: {', '.join(subs[:15])}\n\n"
+            f"Tasks:\n"
+            f"1. Read Gemfile — list ALL dependencies with their purpose\n"
+            f"2. Explore app/ — controllers, models, services, jobs, mailers\n"
+            f"3. Read config/routes.rb — list API endpoints\n"
+            f"4. Find: DB (ActiveRecord adapter), cache (Redis?), queue (Sidekiq?), external APIs\n"
+            f"5. Map layer interactions\n\n"
+            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+        )
+
+    # ── .NET / C# ──
+    csproj = _search(root, ['*.sln', '*.csproj'])
+    if not csproj:
+        # search manually
+        for f in root.rglob('*.csproj'):
+            csproj = f
             break
+    if csproj:
+        dotnet_root = csproj.parent if csproj.suffix == '.csproj' else csproj.parent
+        subs = _subdirs(dotnet_root)
+        add_layer('Backend', dotnet_root, 'C#/.NET',
+            f"Study the .NET/C# project '{root.name}' at: {dotnet_root}\n"
+            f"Dirs: {', '.join(subs[:15])}\n\n"
+            f"Tasks:\n"
+            f"1. Read .csproj — list ALL NuGet dependencies with their purpose\n"
+            f"2. Explore project structure — Controllers, Services, Repositories, Models, DTOs\n"
+            f"3. Find API endpoints (ASP.NET controllers, minimal APIs)\n"
+            f"4. Find: DB (EF Core/Dapper), cache, queue (MassTransit/RabbitMQ?), external clients\n"
+            f"5. Map dependency injection registrations\n\n"
+            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+        )
 
-    # Nova Admin Panel
-    nova_path = root / 'nova-components'
-    if nova_path.exists():
-        components = [d.name for d in nova_path.iterdir() if d.is_dir()]
-        layers.append({
-            'name': 'Admin Panel',
-            'path': str(nova_path),
-            'tech': 'Laravel Nova/Vue.js',
-            'agent_prompt': (
-                f"You are studying the ADMIN PANEL (Laravel Nova) of project '{root.name}' at: {nova_path}\n\n"
-                f"Components found: {', '.join(components[:15])}\n\n"
-                f"For each component:\n"
-                f"1. Read its resources/js/ files — understand what it does\n"
-                f"2. Find props, events, and key functions\n"
-                f"3. Find dependencies between components (cross-imports)\n"
-                f"4. Identify what backend resources/models each component interacts with\n\n"
-                f"Return a JSON object with these fields:\n"
-                f"  tech, description, "
-                f"key_components[{{name, purpose, dependencies[]}}], "
-                f"external_deps[{{name, type, label}}]"
-            ),
-        })
+    # ── Frontend (standalone Vue/React/Angular) ──
+    if not layers or all(l['name'] != 'Frontend' for l in layers):
+        for fe_path in [root / 'resources' / 'js', root / 'frontend', root / 'client', root / 'web']:
+            if fe_path.exists():
+                pkg = fe_path / 'package.json'
+                if not pkg.exists():
+                    pkg = root / 'package.json'
+                try:
+                    data = _json.loads(pkg.read_text(encoding='utf-8')) if pkg.exists() else {}
+                    deps = {**data.get('dependencies', {}), **data.get('devDependencies', {})}
+                    fw = 'Vue' if 'vue' in deps else 'React' if 'react' in deps \
+                        else 'Angular' if '@angular/core' in deps else 'JavaScript'
+                except Exception:
+                    fw = 'JavaScript'
+                add_layer('Frontend', fe_path, fw,
+                    f"Study the {fw} frontend of '{root.name}' at: {fe_path}\n\n"
+                    f"Tasks:\n"
+                    f"1. Read package.json — list key dependencies\n"
+                    f"2. Map components/pages by feature domain\n"
+                    f"3. Find API calls (axios/fetch) — what endpoints are called\n"
+                    f"4. Find state management (Vuex/Pinia/Redux/Zustand)\n"
+                    f"5. Find routing config\n\n"
+                    f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_calls[]"
+                )
+                break
 
-    # Modules (bounded contexts)
-    modules_path = root / 'Modules'
-    if modules_path.exists():
-        mod_names = [d.name for d in modules_path.iterdir() if d.is_dir()]
+    # ── Docker / Infrastructure ──
+    docker_compose = _search(root, ['docker-compose.yml', 'docker-compose.yaml'])
+    if docker_compose:
+        add_layer('Infrastructure', docker_compose.parent, 'Docker/Compose',
+            f"Study the infrastructure of '{root.name}' at: {docker_compose.parent}\n\n"
+            f"Tasks:\n"
+            f"1. Read docker-compose.yml — list ALL services with their roles\n"
+            f"2. For each service: image, ports, volumes, env vars, dependencies\n"
+            f"3. Identify: databases, caches, queues, reverse proxies, monitoring\n"
+            f"4. Map service communication (ports, networks)\n\n"
+            f"Return JSON: tech, description, key_components[{{name,image,purpose}}], external_deps[{{name,type,label}}]"
+        )
+
+    # ── Fallback: generic scan ──
+    if not layers:
+        subs = _subdirs(root)
         layers.append({
-            'name': 'Modules',
-            'path': str(modules_path),
-            'tech': 'PHP/Laravel Modules',
+            'name': 'Project',
+            'path': str(root),
+            'tech': 'Unknown',
             'agent_prompt': (
-                f"You are studying the LARAVEL MODULES (bounded contexts) of project '{root.name}' at: {modules_path}\n\n"
-                f"Modules found: {', '.join(mod_names)}\n\n"
-                f"For each module:\n"
-                f"1. Read Routes/, Http/Controllers/, Models/ — what business domain does it serve\n"
-                f"2. Find cross-module dependencies (service calls, shared models, events)\n"
-                f"3. Identify what events/jobs it produces or consumes\n"
-                f"4. Find its public API (routes, service classes exposed to other modules)\n\n"
-                f"Return a JSON object with a 'modules' array, each item:\n"
-                f"  {{name, description, domain, depends_on[], provides[]}}"
+                f"Study the project '{root.name}' at: {root}\n"
+                f"Directories: {', '.join(subs[:20])}\n\n"
+                f"Tasks:\n"
+                f"1. Identify the technology stack and framework\n"
+                f"2. Map the main architectural layers\n"
+                f"3. List key components with their purpose\n"
+                f"4. Find external dependencies (databases, APIs, services)\n"
+                f"5. Map component relationships\n\n"
+                f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
             ),
         })
 
