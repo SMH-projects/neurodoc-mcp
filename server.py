@@ -409,7 +409,24 @@ def detect_tech(files_data: dict) -> str:
 
 
 def c4_alias(name: str) -> str:
-    return re.sub(r'[^a-zA-Z0-9]', '_', name).strip('_') or 'mod'
+    """Create a short, valid Mermaid node ID from a name.
+    Extracts first meaningful word(s) to avoid 80-char monster IDs.
+    'HTTP API — Chi router — REST endpoints' → 'HTTP_API'
+    'mail-backend — image:latest, ports 8080' → 'mail_backend'
+    """
+    # Take only the part before first separator (—, -, ,) if name is long
+    if len(name) > 25:
+        for sep in (' — ', ' – ', ' - ', ', ', ' ('):
+            idx = name.find(sep)
+            if idx > 3:
+                name = name[:idx]
+                break
+    # Strip non-alphanumeric chars
+    alias = re.sub(r'[^a-zA-Z0-9]', '_', name.strip()).strip('_')
+    # Collapse runs of underscores
+    alias = re.sub(r'_+', '_', alias)
+    # Truncate to 40 chars max
+    return alias[:40] or 'mod'
 
 
 def c4_label(s: str) -> str:
@@ -567,8 +584,9 @@ _REL_LABELS: dict = {
     'dynamodb': 'reads/writes data',
     'cassandra': 'reads/writes data',
     # Cache
-    'redis': 'caches data via',
-    'memcached': 'caches data via',
+    'redis': 'caches via',
+    'memcached': 'caches via',
+    'valkey': 'caches via',
     # HTTP / API
     'axios': 'makes HTTP requests via',
     'httpx': 'makes HTTP requests via',
@@ -1420,6 +1438,34 @@ def _normalize_system_name(name: str) -> str:
     return _SYSTEM_SYNONYMS.get(n, n)
 
 
+_CANONICAL_DISPLAY: dict = {
+    'postgresql': 'PostgreSQL',
+    'mysql': 'MySQL',
+    'mariadb': 'MariaDB',
+    'mongodb': 'MongoDB',
+    'redis': 'Redis',
+    'valkey': 'Valkey',
+    'memcached': 'Memcached',
+    'kafka': 'Kafka',
+    'rabbitmq': 'RabbitMQ',
+    'elasticsearch': 'Elasticsearch',
+    'clickhouse': 'ClickHouse',
+    'cassandra': 'Cassandra',
+    'dynamodb': 'DynamoDB',
+    'sqlserver': 'SQL Server',
+    'minio': 'MinIO',
+    'mailgun': 'Mailgun',
+    'sendgrid': 'SendGrid',
+    'stripe': 'Stripe',
+    'paypal': 'PayPal',
+    'prometheus': 'Prometheus',
+    'grafana': 'Grafana',
+    'sentry': 'Sentry',
+    'datadog': 'Datadog',
+    'nats': 'NATS',
+}
+
+
 def _collect_ext_deps(layers: list) -> dict:
     """Collect real external systems from all layers, deduplicated by normalized name."""
     seen: dict = {}  # normalized_key → {display, type, label}
@@ -1431,11 +1477,13 @@ def _collect_ext_deps(layers: list) -> dict:
             if not is_real_external_system(name):
                 continue
             key = _normalize_system_name(name)
+            # Prefer canonical capitalized display name
+            display = _CANONICAL_DISPLAY.get(key, name)
             if key not in seen:
                 seen[key] = {
-                    'display': name,
+                    'display': display,
                     'type': dep.get('type', 'other'),
-                    'label': dep.get('label') or get_rel_label(name),
+                    'label': dep.get('label') or get_rel_label(key),
                 }
     return seen
 
@@ -1503,8 +1551,18 @@ def _extract_docker_services(layers: list) -> dict:
                 name = comp.get('name', '') or comp.get('image', '')
                 purpose = comp.get('purpose', '')
             else:
-                name = str(comp)
-                purpose = ''
+                raw = str(comp).strip()
+                # Agent ignored instructions and returned "service-name — image, ports, ..."
+                # Extract just the short service name before the first separator
+                for sep in (' — ', ' – ', ' - ', ': ', ', '):
+                    idx = raw.find(sep)
+                    if 2 < idx < 40:
+                        name = raw[:idx].strip()
+                        purpose = raw[idx + len(sep):][:80]
+                        break
+                else:
+                    name = raw
+                    purpose = ''
             name = name.strip()
             if not name or len(name) < 2:
                 continue
@@ -1700,11 +1758,22 @@ def make_c4_component_from_findings(layer: dict) -> list:
             cpurpose = c4_label(cname)
         if not cname:
             continue
-        alias = c4_alias(cname)
+        # If agent ignored instructions and returned a long description as name,
+        # extract the first word/token as the short name for the alias
+        display_name = cname
+        if len(cname) > 30:
+            # take up to first separator
+            short = re.split(r'[\s—\-,:(]', cname)[0].strip()
+            display_name = short if len(short) >= 3 else cname[:25]
+        alias = c4_alias(display_name)
         comp_aliases[cname] = alias
+        comp_aliases[display_name] = alias
         # Normalize variations: "AuthHandler" → also reachable as "auth_handler", "auth"
         comp_aliases[cname.lower()] = alias
-        lines.append(f'    Component({alias}, "{cname}", "{tech}", "{cpurpose}")')
+        comp_aliases[display_name.lower()] = alias
+        # Use display_name as the label so it's short and readable
+        label_name = display_name if len(display_name) <= 30 else display_name[:30]
+        lines.append(f'    Component({alias}, "{label_name}", "{tech}", "{cpurpose}")')
 
     lines.append('  }')
     lines.append('')
@@ -1845,7 +1914,7 @@ def detect_project_layers(root: Path) -> list:
             f"4. Find API layer: HTTP routes or gRPC services\n"
             f"5. Find: DB driver, cache, queue, external HTTP clients\n"
             f"6. Map cross-package data flow\n\n"
-            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
         for proto_dir in ('proto', 'gen', 'pb'):
             if (go_root / proto_dir).exists():
@@ -1881,7 +1950,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Read routes/ — list API/web endpoints grouped by domain\n"
             f"4. Find: DB type, cache (Redis?), queue driver, external APIs\n"
             f"5. Map layer interactions\n\n"
-            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
         # Laravel Nova
         nova_path = php_root / 'nova-components'
@@ -1930,7 +1999,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find API endpoints (FastAPI routes, Django urls, Flask blueprints)\n"
             f"4. Find: DB (SQLAlchemy/Django ORM/etc), cache, queue (Celery?), external HTTP clients\n"
             f"5. Map data flow between layers\n\n"
-            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Node.js / TypeScript ──
@@ -1982,7 +2051,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find REST endpoints (@RestController, @GetMapping etc)\n"
             f"4. Find: DB (JPA/Hibernate/JDBC), cache (Redis?), queue (Kafka/RabbitMQ?), external clients\n"
             f"5. Map Spring beans and their relationships\n\n"
-            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Rust ──
@@ -1999,7 +2068,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find API layer (Axum/Actix/Warp routes)\n"
             f"4. Find: DB (sqlx/diesel/sea-orm), cache, queue, external HTTP clients\n"
             f"5. Map module dependencies\n\n"
-            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Ruby / Rails ──
@@ -2017,7 +2086,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Read config/routes.rb — list API endpoints\n"
             f"4. Find: DB (ActiveRecord adapter), cache (Redis?), queue (Sidekiq?), external APIs\n"
             f"5. Map layer interactions\n\n"
-            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── .NET / C# ──
@@ -2039,7 +2108,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find API endpoints (ASP.NET controllers, minimal APIs)\n"
             f"4. Find: DB (EF Core/Dapper), cache, queue (MassTransit/RabbitMQ?), external clients\n"
             f"5. Map dependency injection registrations\n\n"
-            f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Frontend (standalone Vue/React/Angular) ──
@@ -2075,10 +2144,15 @@ def detect_project_layers(root: Path) -> list:
             f"Study the infrastructure of '{root.name}' at: {docker_compose.parent}\n\n"
             f"Tasks:\n"
             f"1. Read docker-compose.yml — list ALL services with their roles\n"
-            f"2. For each service: image, ports, volumes, env vars, dependencies\n"
-            f"3. Identify: databases, caches, queues, reverse proxies, monitoring\n"
-            f"4. Map service communication (ports, networks)\n\n"
-            f"Return JSON: tech, description, key_components[{{name,image,purpose}}], external_deps[{{name,type,label}}]"
+            f"2. For each service identify: its role (database/cache/queue/proxy/app), image name\n"
+            f"3. Map service dependencies (depends_on, networks)\n\n"
+            f"IMPORTANT for key_components: return ONLY objects with short 'name' (service name from docker-compose, e.g. 'postgres', 'redis', 'nginx', 'backend'). "
+            f"Do NOT include image versions, ports, or descriptions in the name field — those go in 'purpose'.\n\n"
+            f"Return JSON: tech, description, "
+            f"key_components[{{\"name\": \"<short-service-name>\", \"image\": \"<image>\", \"purpose\": \"<one sentence>\"}}], "
+            f"external_deps[{{name,type,label}}]\n\n"
+            f"Example key_components: [{{\"name\": \"postgres\", \"image\": \"postgres:15\", \"purpose\": \"primary database\"}}, "
+            f"{{\"name\": \"redis\", \"image\": \"redis:7\", \"purpose\": \"session cache\"}}]"
         )
 
     # ── Fallback: generic scan ──
@@ -2097,7 +2171,7 @@ def detect_project_layers(root: Path) -> list:
                 f"3. List key components with their purpose\n"
                 f"4. Find external dependencies (databases, APIs, services)\n"
                 f"5. Map component relationships\n\n"
-                f"Return JSON: tech, description, key_components[] (component names: AuthHandler, UserService, MailRepo etc), component_relationships[{{from,to,label}}] (how components call each other), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+                f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
             ),
         })
 
