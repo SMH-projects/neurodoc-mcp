@@ -1582,10 +1582,12 @@ def _extract_docker_services(layers: list) -> dict:
                 stype = 'service'
             key = _normalize_system_name(name)
             if key not in services:
+                # Use canonical capitalized display name when available
+                display = _CANONICAL_DISPLAY.get(key, name)
                 services[key] = {
-                    'display': name,
+                    'display': display,
                     'type': stype,
-                    'label': get_rel_label(name) if stype != 'proxy' else 'routes traffic',
+                    'label': get_rel_label(key) if stype != 'proxy' else 'routes traffic',
                 }
     return services
 
@@ -1907,14 +1909,16 @@ def detect_project_layers(root: Path) -> list:
         add_layer('Backend', go_root, tech,
             f"You are studying the Go backend of '{root.name}' at: {go_root}\n"
             f"Module: {mod_name} | Dirs: {', '.join(subs[:15])}\n\n"
+            f"IMPORTANT: Read actual files — do NOT infer from directory names alone.\n\n"
             f"Tasks:\n"
             f"1. Read go.mod — list ALL dependencies with their purpose\n"
             f"2. Explore cmd/ — what services/binaries are defined\n"
             f"3. Explore internal/, pkg/ — map packages: handlers, services, repositories, models\n"
-            f"4. Find API layer: HTTP routes or gRPC services\n"
-            f"5. Find: DB driver, cache, queue, external HTTP clients\n"
-            f"6. Map cross-package data flow\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"4. Find API layer: HTTP routes or gRPC services (read actual route files)\n"
+            f"5. Find DB driver: read actual imports in db/ or repository files — is it postgres, mysql, sqlite?\n"
+            f"6. Find: cache driver, queue, external HTTP clients (read actual config/env files)\n"
+            f"7. Map cross-package data flow\n\n"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services — verify by reading actual imports, not just file names), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
         for proto_dir in ('proto', 'gen', 'pb'):
             if (go_root / proto_dir).exists():
@@ -1948,9 +1952,9 @@ def detect_project_layers(root: Path) -> list:
             f"1. Read composer.json — list ALL dependencies with their purpose\n"
             f"2. Explore app/ — Controllers, Services, Models, Repositories, Providers\n"
             f"3. Read routes/ — list API/web endpoints grouped by domain\n"
-            f"4. Find: DB type, cache (Redis?), queue driver, external APIs\n"
+            f"4. Find DB type: read .env or config/database.php — check actual driver (mysql/pgsql/sqlite)\n"
             f"5. Map layer interactions\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
         # Laravel Nova
         nova_path = php_root / 'nova-components'
@@ -1997,9 +2001,9 @@ def detect_project_layers(root: Path) -> list:
             f"1. Read pyproject.toml or requirements.txt — list ALL dependencies with their purpose\n"
             f"2. Explore source directories — map modules: routers/views, services, models, schemas\n"
             f"3. Find API endpoints (FastAPI routes, Django urls, Flask blueprints)\n"
-            f"4. Find: DB (SQLAlchemy/Django ORM/etc), cache, queue (Celery?), external HTTP clients\n"
+            f"4. Find DB: read actual connection string in settings.py or .env — is it postgres, mysql, sqlite?\n"
             f"5. Map data flow between layers\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Node.js / TypeScript ──
@@ -2051,7 +2055,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find REST endpoints (@RestController, @GetMapping etc)\n"
             f"4. Find: DB (JPA/Hibernate/JDBC), cache (Redis?), queue (Kafka/RabbitMQ?), external clients\n"
             f"5. Map Spring beans and their relationships\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Rust ──
@@ -2068,7 +2072,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find API layer (Axum/Actix/Warp routes)\n"
             f"4. Find: DB (sqlx/diesel/sea-orm), cache, queue, external HTTP clients\n"
             f"5. Map module dependencies\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Ruby / Rails ──
@@ -2086,7 +2090,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Read config/routes.rb — list API endpoints\n"
             f"4. Find: DB (ActiveRecord adapter), cache (Redis?), queue (Sidekiq?), external APIs\n"
             f"5. Map layer interactions\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── .NET / C# ──
@@ -2108,7 +2112,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find API endpoints (ASP.NET controllers, minimal APIs)\n"
             f"4. Find: DB (EF Core/Dapper), cache, queue (MassTransit/RabbitMQ?), external clients\n"
             f"5. Map dependency injection registrations\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Frontend (standalone Vue/React/Angular) ──
@@ -2171,7 +2175,7 @@ def detect_project_layers(root: Path) -> list:
                 f"3. List key components with their purpose\n"
                 f"4. Find external dependencies (databases, APIs, services)\n"
                 f"5. Map component relationships\n\n"
-                f"Return JSON: tech, description, key_components[] (SHORT names ONLY — e.g. AuthHandler, UserService, MailRepo, HttpHandler. Max 25 chars each. NO descriptions or tech details in the name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+                f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
             ),
         })
 
@@ -2304,15 +2308,36 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
     except _json.JSONDecodeError as e:
         return f"Error parsing findings JSON: {e}"
 
-    # Normalize key_components — coerce dicts/objects to strings to prevent crash
+    # ── Normalize & validate findings ──
+
+    # 1. Deduplicate layers by name (keep first occurrence)
+    seen_layer_names: set = set()
+    deduped_layers = []
+    for layer in data.get('layers', []):
+        lname = layer.get('name', '').strip()
+        if lname and lname not in seen_layer_names:
+            seen_layer_names.add(lname)
+            deduped_layers.append(layer)
+    data['layers'] = deduped_layers
+
+    # 2. Normalize key_components — coerce dicts/objects, deduplicate, strip empty
     for layer in data.get('layers', []):
         kc = layer.get('key_components', [])
-        layer['key_components'] = [
-            item if isinstance(item, str)
-            else item.get('name', str(item)) if isinstance(item, dict)
-            else str(item)
-            for item in kc
-        ]
+        normalized = []
+        seen_kc: set = set()
+        for item in kc:
+            if isinstance(item, dict):
+                s = item.get('name', str(item))
+            elif isinstance(item, str):
+                s = item
+            else:
+                s = str(item)
+            s = s.strip()
+            if s and s not in seen_kc:
+                seen_kc.add(s)
+                normalized.append(s if isinstance(item, str) else item)
+        layer['key_components'] = normalized
+
     for mod in data.get('modules', []):
         kc = mod.get('key_components', [])
         mod['key_components'] = [
@@ -2322,8 +2347,65 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
             for item in kc
         ]
 
+    # 3. Deduplicate modules by name
+    seen_mod_names: set = set()
+    deduped_mods = []
+    for mod in data.get('modules', []):
+        mname = mod.get('name', '').strip()
+        if mname and mname not in seen_mod_names:
+            seen_mod_names.add(mname)
+            deduped_mods.append(mod)
+    data['modules'] = deduped_mods
+
+    # 4. Detect cross-layer DB conflicts (warn but don't block)
+    db_claims: dict = {}  # normalized_key → [source, ...]
+
+    # Collect from external_deps
+    for layer in data.get('layers', []):
+        lname = layer.get('name', '?')
+        for dep in layer.get('external_deps', []):
+            dep_name = dep.get('name', '').strip()
+            dep_type = dep.get('type', '')
+            if dep_type in ('database', 'db') and is_real_external_system(dep_name):
+                key = _normalize_system_name(dep_name)
+                db_claims.setdefault(key, []).append(lname)
+
+    # Also collect from docker/infra key_components
+    for layer in data.get('layers', []):
+        if not any(k in layer.get('name', '').lower() for k in ('infra', 'docker', 'infrastructure')):
+            continue
+        for comp in layer.get('key_components', []):
+            cname = comp.get('name', str(comp)) if isinstance(comp, dict) else str(comp)
+            cname = cname.strip()
+            lower = cname.lower()
+            if any(k in lower for k in ('postgres', 'mysql', 'mariadb', 'mongo', 'clickhouse', 'mssql', 'sqlite')):
+                key = _normalize_system_name(cname)
+                if not any(k in lower for k in ('redis', 'kafka', 'rabbit', 'nginx')):
+                    db_claims.setdefault(key, []).append('docker-compose')
+
+    conflicts = []
+    all_db_keys = list(db_claims.keys())
+    if len(all_db_keys) > 1:
+        # Flag if different DB families (e.g. postgresql vs mysql)
+        unique_families = set(re.sub(r'\d', '', k) for k in all_db_keys)
+        if len(unique_families) > 1:
+            sources = {k: ', '.join(set(db_claims[k])) for k in all_db_keys}
+            detail = '; '.join(f"{k} (from {v})" for k, v in sources.items())
+            conflicts.append(
+                f"Multiple DB families detected: {detail} — verify which is actually used"
+            )
+    data['_validation_warnings'] = conflicts
+
     project_name = data.get('project', root.name)
     out = [f"NeuroDoc Generate — {project_name}", "=" * 52, ""]
+
+    # Show validation warnings upfront
+    warnings = data.get('_validation_warnings', [])
+    if warnings:
+        out.append("⚠ Validation warnings (verify manually):")
+        for w in warnings:
+            out.append(f"  ! {w}")
+        out.append("")
 
     # ── Step 1: Static scan (for per-directory context.md) ──
     out.append("Step 1/4 — Static scan...")
@@ -2385,6 +2467,11 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
         index_lines.append(f"**architecture:** {arch_type}")
         index_lines.append("")
 
+    # Show validation warnings in the index too
+    if warnings:
+        index_lines.append("> ⚠ **Verify manually:** " + "; ".join(warnings))
+        index_lines.append("")
+
     # Architecture overview from agent findings
     if layers_info:
         index_lines.append("## Architecture Overview")
@@ -2397,7 +2484,8 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
             if desc:
                 line += f": {desc}"
             if kc:
-                line += f" | {', '.join(kc)}"
+                kc_names = [c.get('name', str(c)) if isinstance(c, dict) else str(c) for c in kc]
+                line += f" | {', '.join(kc_names)}"
             index_lines.append(line)
         index_lines.append("")
 
