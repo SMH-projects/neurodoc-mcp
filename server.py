@@ -1398,31 +1398,44 @@ import json as _json
 # AGENT FINDINGS → C4 GENERATORS
 # ─────────────────────────────────────────────
 
-def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
-    """Generate C4Context from agent findings — only real external systems."""
-    proj = c4_alias(project_name)
-    layers = findings.get('layers', [])
-    techs = [l.get('tech', '') for l in layers if l.get('tech')]
-    main_tech = techs[0] if techs else 'Application'
+def _normalize_system_name(name: str) -> str:
+    """Normalize for dedup: 'PostgreSQL 15' → 'postgresql', 'Redis 7.0' → 'redis'."""
+    n = re.sub(r'\s+\d[\d.x]*$', '', name.strip(), flags=re.IGNORECASE)
+    return n.lower().replace(' ', '').replace('-', '').replace('_', '')
 
-    # Collect REAL external systems only (not libraries/frameworks)
-    ext_deps: dict = {}
+
+def _collect_ext_deps(layers: list) -> dict:
+    """Collect real external systems from all layers, deduplicated by normalized name."""
+    seen: dict = {}  # normalized_key → {display, type, label}
     for layer in layers:
         for dep in layer.get('external_deps', []):
             name = dep.get('name', '').strip()
             if not name or len(name) < 2:
                 continue
-            # Skip libraries — only keep real external systems
             if not is_real_external_system(name):
                 continue
-            if name not in ext_deps:
-                ext_deps[name] = {
+            key = _normalize_system_name(name)
+            if key not in seen:
+                seen[key] = {
+                    'display': name,
                     'type': dep.get('type', 'other'),
                     'label': dep.get('label') or get_rel_label(name),
                 }
+    return seen
 
-    _DB_TYPES = {'database', 'db'}
-    _QUEUE_TYPES = {'queue', 'broker', 'messaging'}
+
+def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
+    """Generate C4Context — real external systems only, deduplicated."""
+    proj = c4_alias(project_name)
+    layers = findings.get('layers', [])
+    techs = [l.get('tech', '') for l in layers if l.get('tech')]
+    main_tech = techs[0] if techs else 'Application'
+
+    ext_deps = _collect_ext_deps(layers)
+
+    _DB = {'database', 'db'}
+    _QUEUE = {'queue', 'broker', 'messaging'}
+    _CACHE = {'cache'}
 
     lines = [
         '```mermaid', 'C4Context',
@@ -1431,25 +1444,28 @@ def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
         f'  System({proj}, "{project_name}", "{main_tech} application")',
         '',
     ]
-    for name, info in list(ext_deps.items())[:12]:
-        alias = c4_alias(name)
+    for key, info in list(ext_deps.items())[:12]:
+        alias = c4_alias(key)
+        display = info['display']
         dep_type = info['type'].lower()
-        if dep_type in _DB_TYPES:
-            lines.append(f'  SystemDb_Ext({alias}, "{name}", "Database")')
-        elif dep_type in _QUEUE_TYPES:
-            lines.append(f'  SystemQueue_Ext({alias}, "{name}", "Message broker")')
+        if dep_type in _DB:
+            lines.append(f'  SystemDb_Ext({alias}, "{display}", "Database")')
+        elif dep_type in _CACHE:
+            lines.append(f'  SystemDb_Ext({alias}, "{display}", "Cache")')
+        elif dep_type in _QUEUE:
+            lines.append(f'  SystemQueue_Ext({alias}, "{display}", "Message broker")')
         elif dep_type == 'mail':
-            lines.append(f'  System_Ext({alias}, "{name}", "Email provider")')
+            lines.append(f'  System_Ext({alias}, "{display}", "Email provider")')
         elif dep_type == 'monitoring':
-            lines.append(f'  System_Ext({alias}, "{name}", "Monitoring")')
+            lines.append(f'  System_Ext({alias}, "{display}", "Monitoring")')
         elif dep_type == 'payment':
-            lines.append(f'  System_Ext({alias}, "{name}", "Payment gateway")')
+            lines.append(f'  System_Ext({alias}, "{display}", "Payment gateway")')
         else:
-            lines.append(f'  System_Ext({alias}, "{name}", "External system")')
+            lines.append(f'  System_Ext({alias}, "{display}", "External system")')
     lines.append('')
     lines.append(f'  Rel(user, {proj}, "uses")')
-    for name, info in list(ext_deps.items())[:12]:
-        lines.append(f'  Rel({proj}, {c4_alias(name)}, "{info["label"]}")')
+    for key, info in list(ext_deps.items())[:12]:
+        lines.append(f'  Rel({proj}, {c4_alias(key)}, "{info["label"]}")')
     lines.append('```')
     return lines
 
@@ -1656,7 +1672,7 @@ def detect_project_layers(root: Path) -> list:
             f"4. Find API layer: HTTP routes or gRPC services\n"
             f"5. Find: DB driver, cache, queue, external HTTP clients\n"
             f"6. Map cross-package data flow\n\n"
-            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
         for proto_dir in ('proto', 'gen', 'pb'):
             if (go_root / proto_dir).exists():
@@ -1692,7 +1708,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Read routes/ — list API/web endpoints grouped by domain\n"
             f"4. Find: DB type, cache (Redis?), queue driver, external APIs\n"
             f"5. Map layer interactions\n\n"
-            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
         # Laravel Nova
         nova_path = php_root / 'nova-components'
@@ -1741,7 +1757,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find API endpoints (FastAPI routes, Django urls, Flask blueprints)\n"
             f"4. Find: DB (SQLAlchemy/Django ORM/etc), cache, queue (Celery?), external HTTP clients\n"
             f"5. Map data flow between layers\n\n"
-            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Node.js / TypeScript ──
@@ -1793,7 +1809,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find REST endpoints (@RestController, @GetMapping etc)\n"
             f"4. Find: DB (JPA/Hibernate/JDBC), cache (Redis?), queue (Kafka/RabbitMQ?), external clients\n"
             f"5. Map Spring beans and their relationships\n\n"
-            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Rust ──
@@ -1810,7 +1826,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find API layer (Axum/Actix/Warp routes)\n"
             f"4. Find: DB (sqlx/diesel/sea-orm), cache, queue, external HTTP clients\n"
             f"5. Map module dependencies\n\n"
-            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Ruby / Rails ──
@@ -1828,7 +1844,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Read config/routes.rb — list API endpoints\n"
             f"4. Find: DB (ActiveRecord adapter), cache (Redis?), queue (Sidekiq?), external APIs\n"
             f"5. Map layer interactions\n\n"
-            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── .NET / C# ──
@@ -1850,7 +1866,7 @@ def detect_project_layers(root: Path) -> list:
             f"3. Find API endpoints (ASP.NET controllers, minimal APIs)\n"
             f"4. Find: DB (EF Core/Dapper), cache, queue (MassTransit/RabbitMQ?), external clients\n"
             f"5. Map dependency injection registrations\n\n"
-            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+            f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
         )
 
     # ── Frontend (standalone Vue/React/Angular) ──
@@ -1908,7 +1924,7 @@ def detect_project_layers(root: Path) -> list:
                 f"3. List key components with their purpose\n"
                 f"4. Find external dependencies (databases, APIs, services)\n"
                 f"5. Map component relationships\n\n"
-                f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_endpoints[]"
+                f"Return JSON: tech, description, key_components[] (strings), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
             ),
         })
 
