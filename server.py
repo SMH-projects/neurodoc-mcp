@@ -327,26 +327,34 @@ def parse_php(filepath: Path) -> dict:
         return {'functions': [], 'imports': []}
     functions = []
     imports = []
+    seen = set()
     try:
         for m in re.finditer(r'(?:abstract\s+|final\s+)?class\s+(\w+)', content):
-            functions.append(m.group(1))
+            name = m.group(1)
+            if name not in seen:
+                seen.add(name)
+                functions.append({'name': name, 'params': [], 'calls': []})
         for m in re.finditer(r'(?:public|protected|private)(?:\s+static)?\s+function\s+(\w+)\s*\(([^)]*)\)', content):
             name = m.group(1)
-            params = m.group(2).strip()
-            param_list = []
-            for p in params.split(','):
+            raw_params = m.group(2).strip()
+            params = []
+            for p in raw_params.split(','):
                 p = p.strip()
                 pm = re.search(r'\$(\w+)', p)
                 if pm:
-                    param_list.append('$' + pm.group(1))
-            sig = f"{name}({', '.join(param_list)})"
-            functions.append(sig)
+                    params.append('$' + pm.group(1))
+            key = f"{name}({','.join(params)})"
+            if key not in seen:
+                seen.add(key)
+                functions.append({'name': name, 'params': params, 'calls': []})
         for m in re.finditer(r'^use\s+([\w\\]+)(?:\s+as\s+\w+)?;', content, re.MULTILINE):
             parts = m.group(1).split('\\')
-            imports.append(parts[-1])
+            imp = parts[-1]
+            if imp not in imports:
+                imports.append(imp)
     except Exception:
         pass
-    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+    return {'functions': functions, 'imports': imports}
 
 
 # ─────────────────────────────────────────────
@@ -360,18 +368,28 @@ def parse_ruby(filepath: Path) -> dict:
         return {'functions': [], 'imports': []}
     functions = []
     imports = []
+    seen = set()
     try:
         for m in re.finditer(r'^class\s+(\w+)', content, re.MULTILINE):
-            functions.append(m.group(1))
+            name = m.group(1)
+            if name not in seen:
+                seen.add(name)
+                functions.append({'name': name, 'params': [], 'calls': []})
         for m in re.finditer(r'^\s*def\s+(\w+)\s*(?:\(([^)]*)\))?', content, re.MULTILINE):
             name = m.group(1)
-            params = (m.group(2) or '').strip()
-            functions.append(f"{name}({params})" if params else name)
+            raw = (m.group(2) or '').strip()
+            params = [p.strip() for p in raw.split(',')] if raw else []
+            key = f"{name}({','.join(params)})"
+            if key not in seen:
+                seen.add(key)
+                functions.append({'name': name, 'params': params, 'calls': []})
         for m in re.finditer(r'^require(?:_relative)?\s+[\'"]([^\'"]+)[\'"]', content, re.MULTILINE):
-            imports.append(Path(m.group(1)).stem)
+            imp = Path(m.group(1)).stem
+            if imp not in imports:
+                imports.append(imp)
     except Exception:
         pass
-    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+    return {'functions': functions, 'imports': imports}
 
 
 # ─────────────────────────────────────────────
@@ -385,25 +403,33 @@ def parse_java(filepath: Path) -> dict:
         return {'functions': [], 'imports': []}
     functions = []
     imports = []
+    seen = set()
     try:
         for m in re.finditer(r'(?:public|private|protected)?\s*(?:abstract\s+)?class\s+(\w+)', content):
-            functions.append(m.group(1))
+            name = m.group(1)
+            if name not in seen:
+                seen.add(name)
+                functions.append({'name': name, 'params': [], 'calls': []})
         for m in re.finditer(r'(?:public|private|protected)(?:\s+static)?(?:\s+final)?\s+\w[\w<>,\s]*\s+(\w+)\s*\(([^)]*)\)', content):
             name = m.group(1)
-            params = m.group(2).strip()
-            param_parts = []
-            for p in params.split(','):
+            raw = m.group(2).strip()
+            params = []
+            for p in raw.split(','):
                 p = p.strip()
                 parts = p.split()
                 if len(parts) >= 2:
-                    param_parts.append(parts[-2])
-            functions.append(f"{name}({', '.join(param_parts)})")
+                    params.append(parts[-2])
+            key = f"{name}({','.join(params)})"
+            if key not in seen:
+                seen.add(key)
+                functions.append({'name': name, 'params': params, 'calls': []})
         for m in re.finditer(r'^import\s+(?:static\s+)?([\w.]+);', content, re.MULTILINE):
-            parts = m.group(1).split('.')
-            imports.append(parts[-1])
+            imp = m.group(1).split('.')[-1]
+            if imp not in imports:
+                imports.append(imp)
     except Exception:
         pass
-    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+    return {'functions': functions, 'imports': imports}
 
 
 # ─────────────────────────────────────────────
@@ -417,25 +443,33 @@ def parse_csharp(filepath: Path) -> dict:
         return {'functions': [], 'imports': []}
     functions = []
     imports = []
+    seen = set()
     try:
         for m in re.finditer(r'(?:public|internal|private|protected)?\s*(?:abstract\s+|sealed\s+)?class\s+(\w+)', content):
-            functions.append(m.group(1))
+            name = m.group(1)
+            if name not in seen:
+                seen.add(name)
+                functions.append({'name': name, 'params': [], 'calls': []})
         for m in re.finditer(r'(?:public|private|protected|internal)(?:\s+static)?(?:\s+async)?\s+\w[\w<>?,\s]*\s+(\w+)\s*\(([^)]*)\)', content):
             name = m.group(1)
-            params = m.group(2).strip()
-            param_parts = []
-            for p in params.split(','):
+            raw = m.group(2).strip()
+            params = []
+            for p in raw.split(','):
                 p = p.strip()
                 parts = p.split()
                 if len(parts) >= 2:
-                    param_parts.append(parts[0])
-            functions.append(f"{name}({', '.join(param_parts)})")
+                    params.append(parts[0])
+            key = f"{name}({','.join(params)})"
+            if key not in seen:
+                seen.add(key)
+                functions.append({'name': name, 'params': params, 'calls': []})
         for m in re.finditer(r'^using\s+([\w.]+);', content, re.MULTILINE):
-            parts = m.group(1).split('.')
-            imports.append(parts[-1])
+            imp = m.group(1).split('.')[-1]
+            if imp not in imports:
+                imports.append(imp)
     except Exception:
         pass
-    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+    return {'functions': functions, 'imports': imports}
 
 
 # ─────────────────────────────────────────────
@@ -449,19 +483,28 @@ def parse_swift(filepath: Path) -> dict:
         return {'functions': [], 'imports': []}
     functions = []
     imports = []
+    seen = set()
     try:
         for m in re.finditer(r'(?:class|struct|enum|protocol)\s+(\w+)', content):
-            functions.append(m.group(1))
+            name = m.group(1)
+            if name not in seen:
+                seen.add(name)
+                functions.append({'name': name, 'params': [], 'calls': []})
         for m in re.finditer(r'func\s+(\w+)\s*\(([^)]*)\)', content):
             name = m.group(1)
-            params = m.group(2).strip()
-            param_parts = [p.split(':')[0].strip() for p in params.split(',') if ':' in p]
-            functions.append(f"{name}({', '.join(param_parts)})")
+            raw = m.group(2).strip()
+            params = [p.split(':')[0].strip() for p in raw.split(',') if ':' in p]
+            key = f"{name}({','.join(params)})"
+            if key not in seen:
+                seen.add(key)
+                functions.append({'name': name, 'params': params, 'calls': []})
         for m in re.finditer(r'^import\s+(\w+)', content, re.MULTILINE):
-            imports.append(m.group(1))
+            imp = m.group(1)
+            if imp not in imports:
+                imports.append(imp)
     except Exception:
         pass
-    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+    return {'functions': functions, 'imports': imports}
 
 
 # ─────────────────────────────────────────────
@@ -475,24 +518,32 @@ def parse_kotlin(filepath: Path) -> dict:
         return {'functions': [], 'imports': []}
     functions = []
     imports = []
+    seen = set()
     try:
-        for m in re.finditer(r'(?:class|object|interface|data class)\s+(\w+)', content):
-            functions.append(m.group(1))
+        for m in re.finditer(r'(?:class|object|interface|data\s+class)\s+(\w+)', content):
+            name = m.group(1)
+            if name not in seen:
+                seen.add(name)
+                functions.append({'name': name, 'params': [], 'calls': []})
         for m in re.finditer(r'fun\s+(\w+)\s*\(([^)]*)\)', content):
             name = m.group(1)
-            params = m.group(2).strip()
-            param_parts = []
-            for p in params.split(','):
+            raw = m.group(2).strip()
+            params = []
+            for p in raw.split(','):
                 p = p.strip()
                 if ':' in p:
-                    param_parts.append(p.split(':')[0].strip())
-            functions.append(f"{name}({', '.join(param_parts)})")
+                    params.append(p.split(':')[0].strip())
+            key = f"{name}({','.join(params)})"
+            if key not in seen:
+                seen.add(key)
+                functions.append({'name': name, 'params': params, 'calls': []})
         for m in re.finditer(r'^import\s+([\w.]+)', content, re.MULTILINE):
-            parts = m.group(1).split('.')
-            imports.append(parts[-1])
+            imp = m.group(1).split('.')[-1]
+            if imp not in imports:
+                imports.append(imp)
     except Exception:
         pass
-    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+    return {'functions': functions, 'imports': imports}
 
 
 # ─────────────────────────────────────────────
@@ -506,24 +557,33 @@ def parse_rust(filepath: Path) -> dict:
         return {'functions': [], 'imports': []}
     functions = []
     imports = []
+    seen = set()
     try:
         for m in re.finditer(r'(?:pub\s+)?struct\s+(\w+)', content):
-            functions.append(m.group(1))
+            name = m.group(1)
+            if name not in seen:
+                seen.add(name)
+                functions.append({'name': name, 'params': [], 'calls': []})
         for m in re.finditer(r'(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*\(([^)]*)\)', content):
             name = m.group(1)
-            params = m.group(2).strip()
-            param_parts = []
-            for p in params.split(','):
+            raw = m.group(2).strip()
+            params = []
+            for p in raw.split(','):
                 p = p.strip()
                 if ':' in p:
-                    param_parts.append(p.split(':')[0].strip().lstrip('&mut ').lstrip('&'))
-            functions.append(f"{name}({', '.join(param_parts)})")
+                    params.append(re.sub(r'^[&\s]*(mut\s+)?', '', p.split(':')[0].strip()))
+            key = f"{name}({','.join(params)})"
+            if key not in seen:
+                seen.add(key)
+                functions.append({'name': name, 'params': params, 'calls': []})
         for m in re.finditer(r'^use\s+([\w:]+)', content, re.MULTILINE):
-            parts = re.split(r'[::]', m.group(1))
-            imports.append(parts[-1])
+            parts = re.split(r'::', m.group(1))
+            imp = parts[-1]
+            if imp not in imports:
+                imports.append(imp)
     except Exception:
         pass
-    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+    return {'functions': functions, 'imports': imports}
 
 
 # ─────────────────────────────────────────────
