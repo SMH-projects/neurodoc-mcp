@@ -18,6 +18,7 @@ import ast
 import subprocess
 import argparse
 import sys
+import warnings
 
 # ── Transport config ───────────────────────────────────────────────────────────
 def _get_args():
@@ -337,8 +338,8 @@ def scan_dir(dir_path: Path) -> dict:
                 parsed = parse_file(f)
                 if parsed['functions']:
                     result[f.name] = parsed
-    except PermissionError:
-        pass
+    except PermissionError as e:
+        warnings.warn(f"Permission denied: {e}")
     return result
 
 
@@ -382,8 +383,8 @@ def child_subdirs_with_code(dir_path: Path) -> list:
                 )
                 if has_code:
                     result.append(item)
-    except PermissionError:
-        pass
+    except PermissionError as e:
+        warnings.warn(f"Permission denied: {e}")
     return result
 
 
@@ -408,11 +409,15 @@ def detect_tech(files_data: dict) -> str:
     }.get(primary, primary.lstrip('.').upper() or 'Code')
 
 
+_c4_alias_registry: dict = {}
+
+
 def c4_alias(name: str) -> str:
     """Create a short, valid Mermaid node ID from a name.
     Extracts first meaningful word(s) to avoid 80-char monster IDs.
     'HTTP API — Chi router — REST endpoints' → 'HTTP_API'
     'mail-backend — image:latest, ports 8080' → 'mail_backend'
+    Deduplicates aliases by appending _2, _3, etc. when collisions occur.
     """
     # Take only the part before first separator (—, -, ,) if name is long
     if len(name) > 25:
@@ -426,7 +431,12 @@ def c4_alias(name: str) -> str:
     # Collapse runs of underscores
     alias = re.sub(r'_+', '_', alias)
     # Truncate to 40 chars max
-    return alias[:40] or 'mod'
+    base = alias[:40] or 'mod'
+    if base not in _c4_alias_registry:
+        _c4_alias_registry[base] = 1
+        return base
+    _c4_alias_registry[base] += 1
+    return f"{base}_{_c4_alias_registry[base]}"
 
 
 def c4_label(s: str) -> str:
@@ -667,6 +677,7 @@ def collect_external_deps(modules: dict, all_module_names: list) -> list:
 
 def make_c4_context(modules: dict, project_name: str, all_module_names: list) -> list:
     """Return lines for C4Context diagram."""
+    _c4_alias_registry.clear()
     ext_deps = collect_external_deps(modules, all_module_names)
     all_files: dict = {}
     for data in modules.values():
@@ -1066,347 +1077,311 @@ def make_index(modules: dict, project_name: str, root: Path = None) -> str:
 
 
 CLAUDE_MD_RULES = """
-## NeuroDoc — навигационные правила
+# NeuroDoc Navigation Rules
 
-### ПЕРЕД каждой задачей:
-1. Прочитай `context.index.md` в корне проекта
-2. Определи какие модули затрагивает задача
-3. Прочитай `context.md` этих модулей
-4. Прочитай `context.md` их зависимостей (→ links)
-5. Только потом приступай
+## Before Every Task
+1. Read `context.index.md` in the project root — get architecture overview
+2. Identify which modules your task touches
+3. Read `context.md` in those module directories
+4. Read `context.md` of their dependencies (listed after `→` in the header)
+5. Only then start implementation
 
-### ПОСЛЕ каждого изменения кода:
-1. Обнови `context.md` в изменённой директории (запусти ndoc_update)
-2. Обнови `context.index.md` если добавился новый модуль или изменились связи
+## After Every Code Change
+1. Run `ndoc` (leave changed_files empty for git auto-detection)
+2. If you added a new module or changed cross-module dependencies, also update `context.index.md`
 
-### Формат context.md:
+## Context File Format
 ```markdown
 # module_name → dep1, dep2
 
-**used by:** parent_module, other_module
+**used by:** parent_module
 
-## filename.go
-- `FuncA(param1, param2)` → dep1, dep2
-- `FuncB()`
+## filename.ext
+- `FunctionName(param1 Type, param2 Type)` → dep1
+- `HelperName()`
 
 **submodules:** child1, child2
-
 **tags:** keyword1 keyword2
 **updated:** YYYY-MM-DD ndoc
 ```
+
+## Rules
+- Read context.md BEFORE reading source files — it is faster and preserves context window
+- When context.md is stale (updated date old), run ndoc to find and update all stale modules
+- Dependencies listed in `→` header are the modules this module imports from
+- Modules listed in `**used by:**` are modules that import this one
+- `**tags:**` are searchable keywords for this module's domain
 """
 
 
-# ─────────────────────────────────────────────
-# MCP TOOLS
-# ─────────────────────────────────────────────
-
-@mcp.tool()
-def ndoc_init(project_path: str = "") -> str:
-    """
-    Инициализирует NeuroDoc для проекта.
-    Создаёт context.md в каждой папке с кодом, context.index.md с картой зависимостей,
-    и добавляет правила в CLAUDE.md.
-
-    project_path: путь к проекту. Если не указан — использует текущую директорию.
-    """
-    root = resolve_path(project_path)
-    if not root.exists():
-        return f"❌ Папка не найдена: {project_path}"
-
-    out = [f"🚀 NeuroDoc Init — {root.name}", "━" * 48]
-
-    # Сканирование
-    out.append("\n📂 Шаг 1/5 — Сканирование проекта...")
-    dirs_with_code = []
-    for dp, subdirs, files in os.walk(root):
-        subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
-        dp = Path(dp)
-        if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files):
-            dirs_with_code.append(dp)
-
-    # Also include parent dirs that have subdirs with code
-    all_dirs = set(dirs_with_code)
-    for dp in dirs_with_code:
-        parent = dp.parent
-        while parent != root.parent and parent != root:
-            all_dirs.add(parent)
-            parent = parent.parent
-    all_dirs.add(root)
-
-    out.append(f"   ✓ Найдено директорий: {len(all_dirs)}")
-
-    # Парсинг
-    out.append("\n🔍 Шаг 2/5 — Парсинг файлов...")
-    all_module_names = [short_name(d, root) for d in all_dirs]
-    modules: dict = {}
-
-    for dp in sorted(all_dirs):
-        mod = short_name(dp, root)
-        files_data = scan_dir(dp)
-        all_imports, keywords = [], []
-        for fd in files_data.values():
-            all_imports.extend(fd.get('imports', []))
-            keywords.extend([fn['name'] for fn in fd.get('functions', [])[:2]])
-
-        deps = resolve_deps(all_imports, [m for m in all_module_names if m != mod])
-        func_count = sum(len(fd.get('functions', [])) for fd in files_data.values())
-
-        modules[mod] = {
-            'dir_path': dp,
-            'files': files_data,
-            'deps': deps,
-            'keywords': keywords[:4],
-        }
-        if files_data:
-            out.append(f"   ✓ {safe_rel(dp, root) or root.name}/ — "
-                       f"{len(files_data)} файлов, {func_count} функций")
-
-    # Build reverse dependency map: mod → [list of modules that depend on it]
-    reverse_deps: dict = {}
-    for mod, data in modules.items():
-        for dep in data.get('deps', []):
-            reverse_deps.setdefault(dep, []).append(mod)
-
-    # context.md
-    out.append(f"\n📝 Шаг 3/5 — Генерация context.md...")
-    generated = 0
-    for mod, data in modules.items():
-        dp = data['dir_path']
-        content = make_context_md(dp, root, all_module_names, reverse_deps)
-        (dp / 'context.md').write_text(content, encoding='utf-8')
-        generated += 1
-
-    out.append(f"   → Создано: {generated} файлов")
-
-    # context.index.md
-    out.append(f"\n🗺️  Шаг 4/5 — context.index.md...")
-    index_content = make_index(modules, root.name, root)
-    (root / 'context.index.md').write_text(index_content, encoding='utf-8')
-    out.append(f"   ✓ context.index.md — {len(modules)} модулей")
-    out.append(f"   ✓ Map + Graph + Mermaid диаграмма")
-
-    # CLAUDE.md
-    out.append(f"\n⚙️  Шаг 5/5 — Обновление CLAUDE.md...")
+def _ensure_claude_md(root: Path) -> None:
+    """Append NeuroDoc rules to CLAUDE.md if not already present."""
     claude_path = root / 'CLAUDE.md'
     if claude_path.exists():
         existing = claude_path.read_text(encoding='utf-8')
         if 'NeuroDoc' not in existing:
             claude_path.write_text(existing + CLAUDE_MD_RULES, encoding='utf-8')
-            out.append("   ✓ Правила NeuroDoc добавлены в существующий CLAUDE.md")
-        else:
-            out.append("   ℹ️  CLAUDE.md уже содержит правила NeuroDoc")
     else:
         claude_path.write_text(f"# {root.name}\n{CLAUDE_MD_RULES}", encoding='utf-8')
-        out.append("   ✓ CLAUDE.md создан с правилами NeuroDoc")
 
-    out += [
-        "",
-        "━" * 48,
-        "✅ NeuroDoc инициализирован!",
-        "",
-        f"   📁 {generated} context.md файлов",
-        f"   🗺️  context.index.md с Map + Graph",
-        f"   ⚙️  CLAUDE.md обновлён",
-        "",
-        "💡 Запусти ndoc_validate для проверки актуальности.",
-    ]
-    return '\n'.join(out)
 
+# ─────────────────────────────────────────────
+# MCP TOOL
+# ─────────────────────────────────────────────
 
 @mcp.tool()
-def ndoc_update(project_path: str = "", changed_files: str = "") -> str:
+def ndoc(project_path: str = "", changed_files: str = "") -> str:
     """
-    Обновляет context.md для изменённых файлов.
-    changed_files — список файлов через запятую (относительные пути).
-    Если пусто — берёт из git diff или обновляет всё.
-    project_path: если не указан — текущая директория.
+    Analyze, document, and keep a codebase navigable — one command does everything.
+
+    Run this tool:
+    - At the start of any session to understand project structure
+    - After making code changes to update documentation
+    - When you need architecture overview or dependency maps
+
+    What it does automatically:
+    1. Detects project state (fresh install vs. existing docs vs. code changes)
+    2. If no context.md files exist → runs full deep architectural analysis and generates C4 diagrams (Context/Container/Component levels)
+    3. If context.md exists and code changed → updates only the affected modules
+    4. If everything is fresh → returns current architecture summary instantly
+    5. Always returns: architecture overview, dependency map, stale module list
+
+    Parameters:
+    - project_path: Path to project root. Leave empty to use WORKSPACE_ROOT env var or current directory.
+    - changed_files: Comma-separated changed file paths for targeted update (e.g. "app/service.py,app/models.py"). Leave empty for automatic git detection.
+
+    Returns:
+    - Architecture summary from context.index.md
+    - List of modules updated (if any)
+    - List of stale modules needing attention (if any)
+    - C4 diagram summary (on first run)
+
+    Use this as your primary tool for any codebase navigation task. No need to call multiple tools separately.
     """
+    import warnings as _warnings
+
     root = resolve_path(project_path)
     if not root.exists():
-        return f"❌ Папка не найдена: {project_path}"
+        return f"Error: folder not found: {project_path!r}"
 
-    out = ["🔄 NeuroDoc Update", "━" * 40]
+    results = []
 
+    # --- PHASE 1: DETECT STATE ---
+    context_index = root / "context.index.md"
+    context_files = list(root.rglob("context.md"))
+    context_files = [f for f in context_files if not any(
+        skip in f.parts for skip in SKIP_DIRS
+    )]
+
+    has_docs = len(context_files) > 0
+    has_index = context_index.exists()
+
+    # --- PHASE 2: DETECT CHANGES ---
+    changed = []
     if changed_files.strip():
-        files = [root / f.strip() for f in changed_files.split(',')]
-        dirs_to_update = list({f.parent for f in files if f.exists()})
-        out.append(f"\n   Файлы: {changed_files}")
+        changed = [root / p.strip() for p in changed_files.split(",") if p.strip()]
     else:
         try:
             result = subprocess.run(
-                ['git', 'diff', '--name-only', 'HEAD'],
+                ["git", "diff", "--name-only", "HEAD"],
                 cwd=root, capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0 and result.stdout.strip():
-                files = [root / f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
-                dirs_to_update = list({f.parent for f in files if f.parent.exists()})
-                out.append(f"\n   Из git diff: {len(files)} изменённых файлов")
-            else:
-                raise ValueError("no diff")
+                changed = [root / p.strip() for p in result.stdout.strip().splitlines() if p.strip()]
         except Exception:
-            dirs_to_update = []
-            for dp, subdirs, files_in_dir in os.walk(root):
-                subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
-                dp = Path(dp)
-                if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files_in_dir):
-                    dirs_to_update.append(dp)
-            out.append(f"\n   Обновляем все {len(dirs_to_update)} модулей")
+            pass
 
-    if not dirs_to_update:
-        return "ℹ️  Нечего обновлять"
+    # --- PHASE 3: ACT ---
+    module_map = None  # will be populated in whichever branch runs
 
-    all_module_names = []
-    for dp, subdirs, _ in os.walk(root):
-        subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
-        all_module_names.append(short_name(Path(dp), root))
+    if not has_docs:
+        # FULL ANALYSIS - first time
+        results.append("No documentation found — running full project analysis...")
 
-    out.append(f"\n   Обновляем {len(dirs_to_update)} модуль(ей):\n")
-    updated = 0
-    for dp in dirs_to_update:
-        content = make_context_md(dp, root, all_module_names)
-        (dp / 'context.md').write_text(content, encoding='utf-8')
-        out.append(f"   ✓ {safe_rel(dp, root) or root.name}/context.md")
-        updated += 1
+        dirs_with_code = []
+        for dp, subdirs, files in os.walk(root, followlinks=False):
+            subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+            dp = Path(dp)
+            if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files):
+                dirs_with_code.append(dp)
 
-    # Rebuild index and reverse deps
-    modules: dict = {}
-    for dp, subdirs, files_in_dir in os.walk(root):
-        subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
-        dp = Path(dp)
-        if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files_in_dir):
+        all_dirs = set(dirs_with_code)
+        for dp in dirs_with_code:
+            parent = dp.parent
+            while parent != root.parent and parent != root:
+                all_dirs.add(parent)
+                parent = parent.parent
+        all_dirs.add(root)
+
+        all_module_names = [short_name(d, root) for d in all_dirs]
+        module_map = {}
+        for dp in sorted(all_dirs):
             mod = short_name(dp, root)
-            fd_map = scan_dir(dp)
-            all_imp, kw = [], []
-            for fd in fd_map.values():
-                all_imp.extend(fd.get('imports', []))
-                kw.extend([fn['name'] for fn in fd.get('functions', [])[:2]])
-            deps = resolve_deps(all_imp, [m for m in all_module_names if m != mod])
-            modules[mod] = {'dir_path': dp, 'files': fd_map, 'deps': deps, 'keywords': kw[:4]}
+            files_data = scan_dir(dp)
+            all_imports, keywords = [], []
+            for fd in files_data.values():
+                all_imports.extend(fd.get('imports', []))
+                keywords.extend([fn['name'] for fn in fd.get('functions', [])[:2]])
+            deps = resolve_deps(all_imports, [m for m in all_module_names if m != mod])
+            module_map[mod] = {'dir_path': dp, 'files': files_data, 'deps': deps, 'keywords': keywords[:4]}
 
-    reverse_deps: dict = {}
-    for mod, data in modules.items():
-        for dep in data.get('deps', []):
-            reverse_deps.setdefault(dep, []).append(mod)
+        reverse_deps: dict = {}
+        for mod, info in module_map.items():
+            for dep in info.get('deps', []):
+                reverse_deps.setdefault(dep, []).append(mod)
 
-    # Re-generate context.md for updated dirs with reverse_deps
-    for dp in dirs_to_update:
-        content = make_context_md(dp, root, all_module_names, reverse_deps)
-        (dp / 'context.md').write_text(content, encoding='utf-8')
+        written = 0
+        for mod, info in module_map.items():
+            dp = info['dir_path']
+            content = make_context_md(dp, root, all_module_names, reverse_deps)
+            ctx_file = dp / "context.md"
+            try:
+                ctx_file.write_text(content, encoding="utf-8")
+                written += 1
+            except PermissionError as e:
+                _warnings.warn(f"Permission denied writing {ctx_file}: {e}")
 
-    (root / 'context.index.md').write_text(make_index(modules, root.name, root), encoding='utf-8')
-    out.append(f"\n   ✓ context.index.md обновлён")
-    out.append(f"\n✅ Обновлено {updated} context.md файлов")
-    return '\n'.join(out)
+        index_content = make_index(module_map, root.name, root)
+        try:
+            context_index.write_text(index_content, encoding="utf-8")
+        except PermissionError as e:
+            _warnings.warn(f"Permission denied writing context.index.md: {e}")
 
+        _ensure_claude_md(root)
 
-@mcp.tool()
-def ndoc_validate(project_path: str = "") -> str:
-    """
-    Проверяет актуальность context.md файлов.
-    Показывает какие модули свежие, устаревшие или без документации.
-    """
-    root = resolve_path(project_path)
-    if not root.exists():
-        return f"❌ Папка не найдена: {project_path}"
+        results.append(f"Generated {written} context.md files")
+        results.append(f"Generated context.index.md with architecture overview")
 
-    out = ["🔍 NeuroDoc Validate", "━" * 40, ""]
-    fresh, stale, missing = [], [], []
+    elif changed:
+        # INCREMENTAL UPDATE
+        results.append(f"Detected {len(changed)} changed files — updating affected modules...")
 
-    for dp, subdirs, files in os.walk(root):
-        subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
-        dp = Path(dp)
-        code_files = [f for f in files if Path(f).suffix.lower() in CODE_EXTENSIONS]
-        if not code_files:
-            continue
+        affected_dirs = set()
+        for f in changed:
+            if f.parent.exists():
+                affected_dirs.add(f.parent)
 
-        ctx = dp / 'context.md'
-        rel = safe_rel(dp, root) or root.name
+        all_module_names = []
+        for dp, subdirs, _ in os.walk(root, followlinks=False):
+            subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+            all_module_names.append(short_name(Path(dp), root))
 
-        if not ctx.exists():
-            missing.append(rel)
-            continue
+        module_map = {}
+        for dp, subdirs, files_in_dir in os.walk(root, followlinks=False):
+            subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+            dp = Path(dp)
+            if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files_in_dir):
+                mod = short_name(dp, root)
+                fd_map = scan_dir(dp)
+                all_imp, kw = [], []
+                for fd in fd_map.values():
+                    all_imp.extend(fd.get('imports', []))
+                    kw.extend([fn['name'] for fn in fd.get('functions', [])[:2]])
+                deps = resolve_deps(all_imp, [m for m in all_module_names if m != mod])
+                module_map[mod] = {'dir_path': dp, 'files': fd_map, 'deps': deps, 'keywords': kw[:4]}
 
-        ctx_mtime = ctx.stat().st_mtime
-        code_mtimes = [(dp / f).stat().st_mtime for f in code_files if (dp / f).exists()]
-        if code_mtimes and max(code_mtimes) > ctx_mtime:
-            stale.append(rel)
+        reverse_deps = {}
+        for mod, info in module_map.items():
+            for dep in info.get('deps', []):
+                reverse_deps.setdefault(dep, []).append(mod)
+
+        updated = []
+        for d in affected_dirs:
+            mod = short_name(d, root)
+            if mod in module_map:
+                content = make_context_md(d, root, all_module_names, reverse_deps)
+                ctx_file = d / "context.md"
+                try:
+                    ctx_file.write_text(content, encoding="utf-8")
+                    updated.append(str(d.relative_to(root)))
+                except PermissionError as e:
+                    _warnings.warn(f"Permission denied: {e}")
+
+        index_content = make_index(module_map, root.name, root)
+        try:
+            context_index.write_text(index_content, encoding="utf-8")
+        except PermissionError as e:
+            _warnings.warn(f"Permission denied writing context.index.md: {e}")
+
+        if updated:
+            results.append(f"Updated: {', '.join(updated)}")
         else:
-            fresh.append(rel)
+            results.append("Changed files not in documented modules — no updates needed")
 
-    total = len(fresh) + len(stale) + len(missing)
+    else:
+        results.append("Documentation is current — no changes detected")
 
-    if fresh:
-        out.append(f"✅ Актуальные ({len(fresh)}):")
-        for m in fresh:
-            out.append(f"   ✓ {m}/")
+    # --- PHASE 4: VALIDATE (always) ---
+    stale = []
+    missing = []
+
+    if module_map is None:
+        # Build module map for validation only
+        val_module_names = []
+        for dp, subdirs, _ in os.walk(root, followlinks=False):
+            subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+            val_module_names.append(short_name(Path(dp), root))
+        module_map = {}
+        for dp, subdirs, files_in_dir in os.walk(root, followlinks=False):
+            subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+            dp = Path(dp)
+            if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files_in_dir):
+                mod = short_name(dp, root)
+                module_map[mod] = {'dir_path': dp}
+
+    for mod, info in module_map.items():
+        dir_path = info.get('dir_path', root / mod)
+        ctx = dir_path / "context.md"
+        if not ctx.exists():
+            try:
+                missing.append(str(dir_path.relative_to(root)))
+            except ValueError:
+                missing.append(mod)
+        else:
+            ctx_mtime = ctx.stat().st_mtime
+            try:
+                code_mtimes = [
+                    f.stat().st_mtime
+                    for f in dir_path.iterdir()
+                    if f.suffix.lower() in CODE_EXTENSIONS and f.is_file()
+                ]
+                if code_mtimes and max(code_mtimes) > ctx_mtime:
+                    try:
+                        stale.append(str(dir_path.relative_to(root)))
+                    except ValueError:
+                        stale.append(mod)
+            except (PermissionError, OSError) as e:
+                _warnings.warn(f"Cannot check freshness of {ctx}: {e}")
+
     if stale:
-        out.append(f"\n⚠️  Устаревшие ({len(stale)}):")
-        for m in stale:
-            out.append(f"   ⚠ {m}/")
+        results.append(f"Stale modules ({len(stale)}): {', '.join(stale[:10])}")
     if missing:
-        out.append(f"\n❌ Нет context.md ({len(missing)}):")
-        for m in missing:
-            out.append(f"   ✗ {m}/")
+        results.append(f"Undocumented modules ({len(missing)}): {', '.join(missing[:10])}")
 
-    out.append("")
-    if not stale and not missing:
-        out.append("✅ Все context.md актуальны!")
-    else:
-        pct = int(len(fresh) / total * 100) if total > 0 else 0
-        bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-        out.append(f"📊 [{bar}] {pct}% актуально")
-        out.append(f"   {len(fresh)}/{total} свежих · {len(stale)} устаревших · {len(missing)} отсутствуют")
-        out.append("\n💡 Запусти ndoc_update для обновления")
+    # --- PHASE 5: SUMMARY ---
+    if context_index.exists():
+        try:
+            idx_text = context_index.read_text(encoding="utf-8", errors="ignore")
+            lines = idx_text.splitlines()
+            preview = []
+            in_mermaid = False
+            for line in lines:
+                if '```mermaid' in line:
+                    in_mermaid = True
+                    continue
+                if in_mermaid and line.strip() == '```':
+                    in_mermaid = False
+                    continue
+                if not in_mermaid:
+                    preview.append(line)
+                if len(preview) >= 40:
+                    break
+            results.append("\n--- Architecture Summary ---")
+            results.append("\n".join(preview))
+        except Exception:
+            pass
 
-    return '\n'.join(out)
-
-
-@mcp.tool()
-def ndoc_status(project_path: str = "") -> str:
-    """
-    Показывает обзор состояния NeuroDoc для проекта.
-    Отображает карту модулей и граф зависимостей.
-    """
-    root = resolve_path(project_path)
-    if not root.exists():
-        return f"❌ Папка не найдена: {project_path}"
-
-    out = [f"📊 NeuroDoc Status — {root.name}", "━" * 40]
-
-    index_path = root / 'context.index.md'
-    ctx_count = sum(
-        1 for dp, subdirs, files in os.walk(root)
-        for _ in [subdirs.__setitem__(slice(None), [d for d in subdirs if d not in SKIP_DIRS])]
-        if 'context.md' in files
-    )
-
-    out.append(f"\n   📁 context.md файлов: {ctx_count}")
-    out.append(f"   📄 context.index.md: {'✓ найден' if index_path.exists() else '✗ отсутствует'}")
-    claude_path = root / 'CLAUDE.md'
-    has_neurodoc = claude_path.exists() and 'NeuroDoc' in claude_path.read_text(encoding='utf-8')
-    out.append(f"   ⚙️  CLAUDE.md правила: {'✓ подключены' if has_neurodoc else '✗ не подключены'}")
-
-    if index_path.exists():
-        out.append("\n─── context.index.md ───────────────────")
-        lines = index_path.read_text(encoding='utf-8').split('\n')
-        in_mermaid, shown = False, 0
-        for line in lines:
-            if '```mermaid' in line:
-                in_mermaid = True
-                continue
-            if in_mermaid and '```' in line:
-                in_mermaid = False
-                continue
-            if not in_mermaid and shown < 30:
-                out.append(f"  {line}")
-                shown += 1
-        if shown >= 30:
-            out.append("  ...")
-    else:
-        out.append("\n💡 Запусти ndoc_init для инициализации")
-
-    return '\n'.join(out)
+    return "\n".join(results)
 
 
 import json as _json
@@ -1490,6 +1465,7 @@ def _collect_ext_deps(layers: list) -> dict:
 
 def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
     """Generate C4Context — real external systems only, deduplicated."""
+    _c4_alias_registry.clear()
     proj = c4_alias(project_name)
     layers = findings.get('layers', [])
     techs = [l.get('tech', '') for l in layers if l.get('tech')]
@@ -1907,29 +1883,71 @@ def detect_project_layers(root: Path) -> list:
         has_grpc = any(d in subs for d in ('proto', 'gen', 'grpc', 'pb'))
         tech = 'Go/gRPC' if has_grpc else 'Go'
         add_layer('Backend', go_root, tech,
-            f"You are studying the Go backend of '{root.name}' at: {go_root}\n"
+            f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Backend layer of this project.\n\n"
+            f"WHY this matters: Your findings will be used to generate C4 architecture diagrams and navigation context files that help AI assistants navigate this codebase efficiently. Incomplete or vague findings produce unusable diagrams.\n\n"
+            f"Your task: Analyze the Backend layer at {go_root}.\n"
             f"Module: {mod_name} | Dirs: {', '.join(subs[:15])}\n\n"
-            f"IMPORTANT: Read actual files — do NOT infer from directory names alone.\n\n"
-            f"Tasks:\n"
+            f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+            f"1. The primary technology stack (Go version, key frameworks from go.mod)\n"
+            f"2. All major components (handlers, services, repositories, middleware)\n"
+            f"3. Key external dependencies (database driver, cache, queue — read actual imports)\n"
+            f"4. How this layer exposes its API (HTTP routes or gRPC service definitions)\n\n"
+            f"ANALYSIS STEPS:\n"
             f"1. Read go.mod — list ALL dependencies with their purpose\n"
             f"2. Explore cmd/ — what services/binaries are defined\n"
             f"3. Explore internal/, pkg/ — map packages: handlers, services, repositories, models\n"
-            f"4. Find API layer: HTTP routes or gRPC services (read actual route files)\n"
-            f"5. Find DB driver: read actual imports in db/ or repository files — is it postgres, mysql, sqlite?\n"
-            f"6. Find: cache driver, queue, external HTTP clients (read actual config/env files)\n"
-            f"7. Map cross-package data flow\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services — verify by reading actual imports, not just file names), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"4. Find API layer: read actual route files for HTTP or .proto files for gRPC\n"
+            f"5. Find DB driver: read actual imports in db/ or repository files\n"
+            f"6. Find cache, queue, and external HTTP clients from config/env files\n"
+            f"7. Map cross-package data flow (which package calls which)\n\n"
+            f"OUTPUT FORMAT — return exactly this JSON structure:\n"
+            f"<findings>\n"
+            f"{{{{\n"
+            f'  "layer": "Backend",\n'
+            f'  "tech": "Go version, Key Libraries",\n'
+            f'  "description": "One sentence: what this layer does and its role in the system",\n'
+            f'  "key_components": ["ComponentName1", "ComponentName2"],\n'
+            f'  "component_relationships": [{{"from": "HandlerA", "to": "ServiceB", "label": "calls"}}],\n'
+            f'  "external_deps": [{{"name": "PostgreSQL", "type": "database", "label": "reads/writes data"}}],\n'
+            f'  "api_endpoints": [],\n'
+            f'  "key_flows": [{{"title": "Flow name", "steps": [{{"from": "Client", "to": "Handler", "message": "request", "response": "result"}}]}}]\n'
+            f"}}}}\n"
+            f"</findings>\n\n"
+            f"CONSTRAINTS:\n"
+            f"- key_components: list 10-15 items, use exact class/file names found in the code (max 25 chars each)\n"
+            f"- tech: include version numbers visible in go.mod\n"
+            f"- description: one sentence maximum\n"
+            f"- external_deps: only real DBs/queues/APIs/services — verify by reading actual imports"
         )
         for proto_dir in ('proto', 'gen', 'pb'):
             if (go_root / proto_dir).exists():
                 add_layer('gRPC / Protobuf', go_root / proto_dir, 'gRPC/Protobuf',
-                    f"Study the gRPC/Protobuf layer of '{root.name}' at: {go_root / proto_dir}\n\n"
-                    f"Tasks:\n"
+                    f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the gRPC/Protobuf layer of this project.\n\n"
+                    f"WHY this matters: Your findings will be used to generate C4 architecture diagrams showing service contracts and inter-service communication.\n\n"
+                    f"Your task: Analyze the gRPC/Protobuf layer at {go_root / proto_dir}.\n\n"
+                    f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+                    f"1. All .proto service definitions with their RPC methods\n"
+                    f"2. Request/response message types for each RPC\n"
+                    f"3. Which generated clients/servers exist in the codebase\n"
+                    f"4. Cross-service dependencies\n\n"
+                    f"ANALYSIS STEPS:\n"
                     f"1. List all .proto files — services and messages defined\n"
                     f"2. For each service: list RPC methods with request/response types\n"
                     f"3. Find generated code — what clients/servers are generated\n"
                     f"4. Identify cross-service dependencies\n\n"
-                    f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}]"
+                    f"OUTPUT FORMAT:\n"
+                    f"<findings>\n"
+                    f"{{{{\n"
+                    f'  "layer": "gRPC / Protobuf",\n'
+                    f'  "tech": "gRPC/Protobuf, version info",\n'
+                    f'  "description": "One sentence: what contracts this layer defines",\n'
+                    f'  "key_components": ["ServiceName1", "ServiceName2"],\n'
+                    f'  "external_deps": []\n'
+                    f"}}}}\n"
+                    f"</findings>\n\n"
+                    f"CONSTRAINTS:\n"
+                    f"- key_components: use exact service names from .proto files\n"
+                    f"- description: one sentence maximum"
                 )
                 break
 
@@ -1947,42 +1965,103 @@ def detect_project_layers(root: Path) -> list:
             framework = 'PHP'
         subs = _subdirs(php_root)
         add_layer('Backend', php_root, f'PHP/{framework}',
-            f"Study the {framework} backend of '{root.name}' at: {php_root}\n\n"
-            f"Tasks:\n"
+            f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Backend layer of this project.\n\n"
+            f"WHY this matters: Your findings will be used to generate C4 architecture diagrams and navigation context files that help AI assistants navigate this codebase efficiently. Incomplete or vague findings produce unusable diagrams.\n\n"
+            f"Your task: Analyze the {framework} Backend layer at {php_root}.\n\n"
+            f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+            f"1. The primary technology stack (framework version, PHP version from composer.json)\n"
+            f"2. All major components (Controllers, Services, Models, Repositories, Providers)\n"
+            f"3. Key external dependencies (database driver, cache, queue — read actual config)\n"
+            f"4. How this layer exposes its API (routes grouped by domain)\n\n"
+            f"ANALYSIS STEPS:\n"
             f"1. Read composer.json — list ALL dependencies with their purpose\n"
             f"2. Explore app/ — Controllers, Services, Models, Repositories, Providers\n"
             f"3. Read routes/ — list API/web endpoints grouped by domain\n"
             f"4. Find DB type: read .env or config/database.php — check actual driver (mysql/pgsql/sqlite)\n"
-            f"5. Map layer interactions\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"5. Map layer interactions (which controller calls which service, which service calls which repo)\n\n"
+            f"OUTPUT FORMAT — return exactly this JSON structure:\n"
+            f"<findings>\n"
+            f"{{{{\n"
+            f'  "layer": "Backend",\n'
+            f'  "tech": "PHP/Framework version, Key Libraries",\n'
+            f'  "description": "One sentence: what this layer does and its role in the system",\n'
+            f'  "key_components": ["ComponentName1", "ComponentName2"],\n'
+            f'  "component_relationships": [{{"from": "ControllerA", "to": "ServiceB", "label": "calls"}}],\n'
+            f'  "external_deps": [{{"name": "PostgreSQL", "type": "database", "label": "reads/writes data"}}],\n'
+            f'  "api_endpoints": [],\n'
+            f'  "key_flows": [{{"title": "Flow name", "steps": [{{"from": "Client", "to": "Controller", "message": "request", "response": "result"}}]}}]\n'
+            f"}}}}\n"
+            f"</findings>\n\n"
+            f"CONSTRAINTS:\n"
+            f"- key_components: list 10-15 items, use exact class names found in the code (max 25 chars each)\n"
+            f"- tech: include version numbers visible in composer.json\n"
+            f"- description: one sentence maximum\n"
+            f"- external_deps: only real DBs/queues/APIs/services — verify by reading actual config files"
         )
         # Laravel Nova
         nova_path = php_root / 'nova-components'
         if nova_path.exists():
             components = [d.name for d in nova_path.iterdir() if d.is_dir()]
             add_layer('Admin Panel', nova_path, 'Laravel Nova/Vue.js',
-                f"Study the Nova admin panel of '{root.name}' at: {nova_path}\n"
+                f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Admin Panel layer of this project.\n\n"
+                f"WHY this matters: Your findings will be used to generate C4 architecture diagrams showing the admin interface and its backend model connections.\n\n"
+                f"Your task: Analyze the Admin Panel layer at {nova_path}.\n"
                 f"Components: {', '.join(components[:15])}\n\n"
-                f"Tasks:\n"
+                f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+                f"1. The technology stack (Nova version, Vue.js version)\n"
+                f"2. All Nova components with their purpose\n"
+                f"3. Cross-component dependencies (imports)\n"
+                f"4. Which backend models each component interacts with\n\n"
+                f"ANALYSIS STEPS:\n"
                 f"1. For each component — read resources/js/ files, understand its purpose\n"
                 f"2. Find props, events, key functions\n"
                 f"3. Find cross-component dependencies (imports)\n"
                 f"4. Identify what backend models each component interacts with\n\n"
-                f"Return JSON: tech, description, key_components[{{name,purpose,dependencies[]}}], external_deps[{{name,type,label}}]"
+                f"OUTPUT FORMAT:\n"
+                f"<findings>\n"
+                f"{{{{\n"
+                f'  "layer": "Admin Panel",\n'
+                f'  "tech": "Laravel Nova/Vue.js, version info",\n'
+                f'  "description": "One sentence: what this admin panel manages",\n'
+                f'  "key_components": [{{"name": "ComponentName", "purpose": "what it does", "dependencies": []}}],\n'
+                f'  "external_deps": []\n'
+                f"}}}}\n"
+                f"</findings>\n\n"
+                f"CONSTRAINTS:\n"
+                f"- key_components: use exact component directory names\n"
+                f"- description: one sentence maximum"
             )
         # Laravel Modules
         modules_path = php_root / 'Modules'
         if modules_path.exists():
             mod_names = [d.name for d in modules_path.iterdir() if d.is_dir()]
             add_layer('Modules', modules_path, 'PHP/Laravel Modules',
-                f"Study the Laravel modules (bounded contexts) of '{root.name}' at: {modules_path}\n"
+                f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Modules (bounded contexts) layer of this project.\n\n"
+                f"WHY this matters: Your findings will be used to generate C4 architecture diagrams showing bounded contexts and their inter-module communication.\n\n"
+                f"Your task: Analyze the Laravel modules at {modules_path}.\n"
                 f"Modules: {', '.join(mod_names)}\n\n"
-                f"Tasks:\n"
-                f"1. For each module — Routes/, Controllers/, Models/ — what domain does it serve\n"
-                f"2. Find cross-module dependencies\n"
+                f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+                f"1. The domain each module serves (e.g., Auth, Billing, Notifications)\n"
+                f"2. Cross-module dependencies (which module imports from which)\n"
+                f"3. Events/jobs produced or consumed by each module\n"
+                f"4. The public API each module exposes to others\n\n"
+                f"ANALYSIS STEPS:\n"
+                f"1. For each module — examine Routes/, Controllers/, Models/ — what domain it serves\n"
+                f"2. Find cross-module dependencies (use statements, service provider registrations)\n"
                 f"3. Identify events/jobs produced or consumed\n"
                 f"4. Find public API exposed to other modules\n\n"
-                f"Return JSON: modules[{{name, description, domain, depends_on[], provides[]}}]"
+                f"OUTPUT FORMAT:\n"
+                f"<findings>\n"
+                f"{{{{\n"
+                f'  "layer": "Modules",\n'
+                f'  "tech": "PHP/Laravel Modules",\n'
+                f'  "description": "One sentence: what domain these modules collectively cover",\n'
+                f'  "modules": [{{"name": "ModuleName", "description": "domain purpose", "domain": "domain", "depends_on": [], "provides": []}}]\n'
+                f"}}}}\n"
+                f"</findings>\n\n"
+                f"CONSTRAINTS:\n"
+                f"- modules: list all modules found in the directory\n"
+                f"- description: one sentence maximum per module"
             )
 
     # ── Python ──
@@ -1995,15 +2074,39 @@ def detect_project_layers(root: Path) -> list:
             else 'Flask' if any(s in subs for s in ('blueprints',)) \
             else 'Python'
         add_layer('Backend', py_root, f'Python/{framework}',
-            f"Study the Python/{framework} backend of '{root.name}' at: {py_root}\n"
+            f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Backend layer of this project.\n\n"
+            f"WHY this matters: Your findings will be used to generate C4 architecture diagrams and navigation context files that help AI assistants navigate this codebase efficiently. Incomplete or vague findings produce unusable diagrams.\n\n"
+            f"Your task: Analyze the Python/{framework} Backend layer at {py_root}.\n"
             f"Dirs: {', '.join(subs[:15])}\n\n"
-            f"Tasks:\n"
+            f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+            f"1. The primary technology stack (framework version, Python version from pyproject.toml)\n"
+            f"2. All major components (routers/views, services, models, schemas)\n"
+            f"3. Key external dependencies (database, cache, queue — read actual connection strings)\n"
+            f"4. How this layer exposes its API (routes/endpoints grouped by domain)\n\n"
+            f"ANALYSIS STEPS:\n"
             f"1. Read pyproject.toml or requirements.txt — list ALL dependencies with their purpose\n"
             f"2. Explore source directories — map modules: routers/views, services, models, schemas\n"
             f"3. Find API endpoints (FastAPI routes, Django urls, Flask blueprints)\n"
-            f"4. Find DB: read actual connection string in settings.py or .env — is it postgres, mysql, sqlite?\n"
-            f"5. Map data flow between layers\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"4. Find DB: read actual connection string in settings.py or .env\n"
+            f"5. Map data flow between layers (which router calls which service, which service calls which model)\n\n"
+            f"OUTPUT FORMAT — return exactly this JSON structure:\n"
+            f"<findings>\n"
+            f"{{{{\n"
+            f'  "layer": "Backend",\n'
+            f'  "tech": "Python/Framework version, Key Libraries",\n'
+            f'  "description": "One sentence: what this layer does and its role in the system",\n'
+            f'  "key_components": ["ComponentName1", "ComponentName2"],\n'
+            f'  "component_relationships": [{{"from": "RouterA", "to": "ServiceB", "label": "calls"}}],\n'
+            f'  "external_deps": [{{"name": "PostgreSQL", "type": "database", "label": "reads/writes data"}}],\n'
+            f'  "api_endpoints": [],\n'
+            f'  "key_flows": [{{"title": "Flow name", "steps": [{{"from": "Client", "to": "Router", "message": "request", "response": "result"}}]}}]\n'
+            f"}}}}\n"
+            f"</findings>\n\n"
+            f"CONSTRAINTS:\n"
+            f"- key_components: list 10-15 items, use exact class/file names found in the code (max 25 chars each)\n"
+            f"- tech: include version numbers visible in pyproject.toml or requirements.txt\n"
+            f"- description: one sentence maximum\n"
+            f"- external_deps: only real DBs/queues/APIs/services — verify by reading actual config files"
         )
 
     # ── Node.js / TypeScript ──
@@ -2028,15 +2131,36 @@ def detect_project_layers(root: Path) -> list:
             d in subs for d in ('controllers', 'services', 'handlers', 'routes'))
         layer_name = 'Frontend' if is_frontend else 'Backend'
         add_layer(layer_name, pkg_root, f'TypeScript/{framework}' if (pkg_root / 'tsconfig.json').exists() else framework,
-            f"Study the {framework} {'frontend' if is_frontend else 'backend'} of '{root.name}' at: {pkg_root}\n"
+            f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the {layer_name} layer of this project.\n\n"
+            f"WHY this matters: Your findings will be used to generate C4 architecture diagrams and navigation context files that help AI assistants navigate this codebase efficiently. Incomplete or vague findings produce unusable diagrams.\n\n"
+            f"Your task: Analyze the {framework} {layer_name.lower()} layer at {pkg_root}.\n"
             f"Dirs: {', '.join(subs[:15])}\n\n"
-            f"Tasks:\n"
+            f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+            f"1. The primary technology stack (framework version, language version from package.json)\n"
+            f"2. All major components ({'components, pages, hooks, stores' if is_frontend else 'controllers, services, repositories, modules'})\n"
+            f"3. Key external dependencies ({'API endpoints called' if is_frontend else 'DB driver, cache, queue, external APIs'})\n"
+            f"4. How this layer {'communicates with the backend' if is_frontend else 'exposes its API'}\n\n"
+            f"ANALYSIS STEPS:\n"
             f"1. Read package.json — list ALL dependencies with their purpose\n"
             f"2. Explore src/ — map modules: {'components, pages, hooks, stores' if is_frontend else 'controllers, services, repositories, modules'}\n"
             f"3. Find {'API calls (axios/fetch) — what endpoints are called' if is_frontend else 'API routes/endpoints grouped by domain'}\n"
-            f"4. Find: {'state management (Redux/Zustand/Pinia)' if is_frontend else 'DB driver, cache, queue, external APIs'}\n"
+            f"4. Find {'state management (Redux/Zustand/Pinia)' if is_frontend else 'DB driver, cache, queue, external APIs'}\n"
             f"5. Map cross-module dependencies\n\n"
-            f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], {'api_calls[]' if is_frontend else 'api_endpoints[]'}"
+            f"OUTPUT FORMAT — return exactly this JSON structure:\n"
+            f"<findings>\n"
+            f"{{{{\n"
+            f'  "layer": "{layer_name}",\n'
+            f'  "tech": "TypeScript/Framework version, Key Libraries",\n'
+            f'  "description": "One sentence: what this layer does and its role in the system",\n'
+            f'  "key_components": ["ComponentName1", "ComponentName2"],\n'
+            f'  "external_deps": [{{"name": "dep", "type": "other", "label": "uses"}}],\n'
+            + ('  "api_calls": []\n' if is_frontend else '  "api_endpoints": []\n') +
+            f"}}}}\n"
+            f"</findings>\n\n"
+            f"CONSTRAINTS:\n"
+            f"- key_components: list 10-15 items, use exact component/file names found in the code (max 25 chars each)\n"
+            f"- tech: include version numbers visible in package.json\n"
+            f"- description: one sentence maximum"
         )
 
     # ── Java / Kotlin / Spring ──
@@ -2047,15 +2171,39 @@ def detect_project_layers(root: Path) -> list:
         tech = 'Kotlin/Spring' if is_kotlin else 'Java/Spring'
         subs = _subdirs(java_root)
         add_layer('Backend', java_root, tech,
-            f"Study the {tech} backend of '{root.name}' at: {java_root}\n"
+            f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Backend layer of this project.\n\n"
+            f"WHY this matters: Your findings will be used to generate C4 architecture diagrams and navigation context files that help AI assistants navigate this codebase efficiently. Incomplete or vague findings produce unusable diagrams.\n\n"
+            f"Your task: Analyze the {tech} Backend layer at {java_root}.\n"
             f"Dirs: {', '.join(subs[:15])}\n\n"
-            f"Tasks:\n"
+            f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+            f"1. The primary technology stack (Spring version, Java/Kotlin version from pom.xml/build.gradle)\n"
+            f"2. All major components (controllers, services, repositories, models, config)\n"
+            f"3. Key external dependencies (DB driver, cache, queue — read actual configuration)\n"
+            f"4. How this layer exposes its API (REST endpoints grouped by domain)\n\n"
+            f"ANALYSIS STEPS:\n"
             f"1. Read pom.xml or build.gradle — list ALL dependencies with their purpose\n"
             f"2. Explore src/main/ — map packages: controllers, services, repositories, models, config\n"
             f"3. Find REST endpoints (@RestController, @GetMapping etc)\n"
-            f"4. Find: DB (JPA/Hibernate/JDBC), cache (Redis?), queue (Kafka/RabbitMQ?), external clients\n"
+            f"4. Find DB (JPA/Hibernate/JDBC), cache (Redis?), queue (Kafka/RabbitMQ?), external clients\n"
             f"5. Map Spring beans and their relationships\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"OUTPUT FORMAT — return exactly this JSON structure:\n"
+            f"<findings>\n"
+            f"{{{{\n"
+            f'  "layer": "Backend",\n'
+            f'  "tech": "{tech} version, Key Libraries",\n'
+            f'  "description": "One sentence: what this layer does and its role in the system",\n'
+            f'  "key_components": ["ComponentName1", "ComponentName2"],\n'
+            f'  "component_relationships": [{{"from": "ControllerA", "to": "ServiceB", "label": "calls"}}],\n'
+            f'  "external_deps": [{{"name": "PostgreSQL", "type": "database", "label": "reads/writes data"}}],\n'
+            f'  "api_endpoints": [],\n'
+            f'  "key_flows": [{{"title": "Flow name", "steps": [{{"from": "Client", "to": "Controller", "message": "request", "response": "result"}}]}}]\n'
+            f"}}}}\n"
+            f"</findings>\n\n"
+            f"CONSTRAINTS:\n"
+            f"- key_components: list 10-15 items, use exact class names found in the code (max 25 chars each)\n"
+            f"- tech: include version numbers visible in pom.xml or build.gradle\n"
+            f"- description: one sentence maximum\n"
+            f"- external_deps: only real DBs/queues/APIs/services — verify by reading actual configuration"
         )
 
     # ── Rust ──
@@ -2064,15 +2212,39 @@ def detect_project_layers(root: Path) -> list:
         rust_root = cargo.parent
         subs = _subdirs(rust_root)
         add_layer('Backend', rust_root, 'Rust',
-            f"Study the Rust project '{root.name}' at: {rust_root}\n"
+            f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Backend layer of this project.\n\n"
+            f"WHY this matters: Your findings will be used to generate C4 architecture diagrams and navigation context files that help AI assistants navigate this codebase efficiently. Incomplete or vague findings produce unusable diagrams.\n\n"
+            f"Your task: Analyze the Rust Backend layer at {rust_root}.\n"
             f"Dirs: {', '.join(subs[:15])}\n\n"
-            f"Tasks:\n"
+            f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+            f"1. The primary technology stack (Rust edition, web framework, key crates from Cargo.toml)\n"
+            f"2. All major components (handlers, services, models, db, config)\n"
+            f"3. Key external dependencies (DB crate, cache, queue — read actual Cargo.toml)\n"
+            f"4. How this layer exposes its API (Axum/Actix/Warp routes)\n\n"
+            f"ANALYSIS STEPS:\n"
             f"1. Read Cargo.toml — list ALL dependencies with their purpose\n"
             f"2. Explore src/ — map modules: handlers, services, models, db, config\n"
             f"3. Find API layer (Axum/Actix/Warp routes)\n"
-            f"4. Find: DB (sqlx/diesel/sea-orm), cache, queue, external HTTP clients\n"
+            f"4. Find DB (sqlx/diesel/sea-orm), cache, queue, external HTTP clients\n"
             f"5. Map module dependencies\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"OUTPUT FORMAT — return exactly this JSON structure:\n"
+            f"<findings>\n"
+            f"{{{{\n"
+            f'  "layer": "Backend",\n'
+            f'  "tech": "Rust edition, Framework, Key Crates",\n'
+            f'  "description": "One sentence: what this layer does and its role in the system",\n'
+            f'  "key_components": ["ComponentName1", "ComponentName2"],\n'
+            f'  "component_relationships": [{{"from": "HandlerA", "to": "ServiceB", "label": "calls"}}],\n'
+            f'  "external_deps": [{{"name": "PostgreSQL", "type": "database", "label": "reads/writes data"}}],\n'
+            f'  "api_endpoints": [],\n'
+            f'  "key_flows": [{{"title": "Flow name", "steps": [{{"from": "Client", "to": "Handler", "message": "request", "response": "result"}}]}}]\n'
+            f"}}}}\n"
+            f"</findings>\n\n"
+            f"CONSTRAINTS:\n"
+            f"- key_components: list 10-15 items, use exact module/struct names found in the code (max 25 chars each)\n"
+            f"- tech: include version info visible in Cargo.toml\n"
+            f"- description: one sentence maximum\n"
+            f"- external_deps: only real DBs/queues/APIs/services — verify by reading actual Cargo.toml"
         )
 
     # ── Ruby / Rails ──
@@ -2082,15 +2254,39 @@ def detect_project_layers(root: Path) -> list:
         subs = _subdirs(ruby_root)
         framework = 'Rails' if (ruby_root / 'config' / 'routes.rb').exists() else 'Ruby'
         add_layer('Backend', ruby_root, f'Ruby/{framework}',
-            f"Study the Ruby/{framework} backend of '{root.name}' at: {ruby_root}\n"
+            f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Backend layer of this project.\n\n"
+            f"WHY this matters: Your findings will be used to generate C4 architecture diagrams and navigation context files that help AI assistants navigate this codebase efficiently. Incomplete or vague findings produce unusable diagrams.\n\n"
+            f"Your task: Analyze the Ruby/{framework} Backend layer at {ruby_root}.\n"
             f"Dirs: {', '.join(subs[:15])}\n\n"
-            f"Tasks:\n"
+            f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+            f"1. The primary technology stack (Rails/Ruby version from Gemfile)\n"
+            f"2. All major components (controllers, models, services, jobs, mailers)\n"
+            f"3. Key external dependencies (DB adapter, cache, queue — read actual config/database.yml)\n"
+            f"4. How this layer exposes its API (routes from config/routes.rb)\n\n"
+            f"ANALYSIS STEPS:\n"
             f"1. Read Gemfile — list ALL dependencies with their purpose\n"
             f"2. Explore app/ — controllers, models, services, jobs, mailers\n"
             f"3. Read config/routes.rb — list API endpoints\n"
-            f"4. Find: DB (ActiveRecord adapter), cache (Redis?), queue (Sidekiq?), external APIs\n"
+            f"4. Find DB (ActiveRecord adapter), cache (Redis?), queue (Sidekiq?), external APIs\n"
             f"5. Map layer interactions\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"OUTPUT FORMAT — return exactly this JSON structure:\n"
+            f"<findings>\n"
+            f"{{{{\n"
+            f'  "layer": "Backend",\n'
+            f'  "tech": "Ruby/Framework version, Key Gems",\n'
+            f'  "description": "One sentence: what this layer does and its role in the system",\n'
+            f'  "key_components": ["ComponentName1", "ComponentName2"],\n'
+            f'  "component_relationships": [{{"from": "ControllerA", "to": "ServiceB", "label": "calls"}}],\n'
+            f'  "external_deps": [{{"name": "PostgreSQL", "type": "database", "label": "reads/writes data"}}],\n'
+            f'  "api_endpoints": [],\n'
+            f'  "key_flows": [{{"title": "Flow name", "steps": [{{"from": "Client", "to": "Controller", "message": "request", "response": "result"}}]}}]\n'
+            f"}}}}\n"
+            f"</findings>\n\n"
+            f"CONSTRAINTS:\n"
+            f"- key_components: list 10-15 items, use exact class names found in the code (max 25 chars each)\n"
+            f"- tech: include version numbers visible in Gemfile\n"
+            f"- description: one sentence maximum\n"
+            f"- external_deps: only real DBs/queues/APIs/services — verify by reading actual config files"
         )
 
     # ── .NET / C# ──
@@ -2104,15 +2300,39 @@ def detect_project_layers(root: Path) -> list:
         dotnet_root = csproj.parent if csproj.suffix == '.csproj' else csproj.parent
         subs = _subdirs(dotnet_root)
         add_layer('Backend', dotnet_root, 'C#/.NET',
-            f"Study the .NET/C# project '{root.name}' at: {dotnet_root}\n"
+            f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Backend layer of this project.\n\n"
+            f"WHY this matters: Your findings will be used to generate C4 architecture diagrams and navigation context files that help AI assistants navigate this codebase efficiently. Incomplete or vague findings produce unusable diagrams.\n\n"
+            f"Your task: Analyze the C#/.NET Backend layer at {dotnet_root}.\n"
             f"Dirs: {', '.join(subs[:15])}\n\n"
-            f"Tasks:\n"
+            f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+            f"1. The primary technology stack (.NET version, ASP.NET version from .csproj)\n"
+            f"2. All major components (Controllers, Services, Repositories, Models, DTOs)\n"
+            f"3. Key external dependencies (DB provider, cache, queue — read actual appsettings.json)\n"
+            f"4. How this layer exposes its API (ASP.NET controllers or minimal API endpoints)\n\n"
+            f"ANALYSIS STEPS:\n"
             f"1. Read .csproj — list ALL NuGet dependencies with their purpose\n"
             f"2. Explore project structure — Controllers, Services, Repositories, Models, DTOs\n"
             f"3. Find API endpoints (ASP.NET controllers, minimal APIs)\n"
-            f"4. Find: DB (EF Core/Dapper), cache, queue (MassTransit/RabbitMQ?), external clients\n"
+            f"4. Find DB (EF Core/Dapper), cache, queue (MassTransit/RabbitMQ?), external clients\n"
             f"5. Map dependency injection registrations\n\n"
-            f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+            f"OUTPUT FORMAT — return exactly this JSON structure:\n"
+            f"<findings>\n"
+            f"{{{{\n"
+            f'  "layer": "Backend",\n'
+            f'  "tech": "C#/.NET version, Key Packages",\n'
+            f'  "description": "One sentence: what this layer does and its role in the system",\n'
+            f'  "key_components": ["ComponentName1", "ComponentName2"],\n'
+            f'  "component_relationships": [{{"from": "ControllerA", "to": "ServiceB", "label": "calls"}}],\n'
+            f'  "external_deps": [{{"name": "PostgreSQL", "type": "database", "label": "reads/writes data"}}],\n'
+            f'  "api_endpoints": [],\n'
+            f'  "key_flows": [{{"title": "Flow name", "steps": [{{"from": "Client", "to": "Controller", "message": "request", "response": "result"}}]}}]\n'
+            f"}}}}\n"
+            f"</findings>\n\n"
+            f"CONSTRAINTS:\n"
+            f"- key_components: list 10-15 items, use exact class names found in the code (max 25 chars each)\n"
+            f"- tech: include version numbers visible in .csproj\n"
+            f"- description: one sentence maximum\n"
+            f"- external_deps: only real DBs/queues/APIs/services — verify by reading actual appsettings.json"
         )
 
     # ── Frontend (standalone Vue/React/Angular) ──
@@ -2130,14 +2350,35 @@ def detect_project_layers(root: Path) -> list:
                 except Exception:
                     fw = 'JavaScript'
                 add_layer('Frontend', fe_path, fw,
-                    f"Study the {fw} frontend of '{root.name}' at: {fe_path}\n\n"
-                    f"Tasks:\n"
+                    f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Frontend layer of this project.\n\n"
+                    f"WHY this matters: Your findings will be used to generate C4 architecture diagrams showing the frontend layer and its communication with the backend.\n\n"
+                    f"Your task: Analyze the {fw} Frontend layer at {fe_path}.\n\n"
+                    f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+                    f"1. The primary technology stack (framework version from package.json)\n"
+                    f"2. All major components/pages grouped by feature domain\n"
+                    f"3. Which API endpoints this frontend calls (from axios/fetch usage)\n"
+                    f"4. How this layer manages state and routing\n\n"
+                    f"ANALYSIS STEPS:\n"
                     f"1. Read package.json — list key dependencies\n"
                     f"2. Map components/pages by feature domain\n"
                     f"3. Find API calls (axios/fetch) — what endpoints are called\n"
                     f"4. Find state management (Vuex/Pinia/Redux/Zustand)\n"
                     f"5. Find routing config\n\n"
-                    f"Return JSON: tech, description, key_components[], external_deps[{{name,type,label}}], api_calls[]"
+                    f"OUTPUT FORMAT:\n"
+                    f"<findings>\n"
+                    f"{{{{\n"
+                    f'  "layer": "Frontend",\n'
+                    f'  "tech": "{fw}, version info",\n'
+                    f'  "description": "One sentence: what this frontend does and who uses it",\n'
+                    f'  "key_components": ["ComponentName1", "ComponentName2"],\n'
+                    f'  "external_deps": [],\n'
+                    f'  "api_calls": []\n'
+                    f"}}}}\n"
+                    f"</findings>\n\n"
+                    f"CONSTRAINTS:\n"
+                    f"- key_components: list 10-15 items, use exact component/page names (max 25 chars each)\n"
+                    f"- tech: include version numbers visible in package.json\n"
+                    f"- description: one sentence maximum"
                 )
                 break
 
@@ -2145,18 +2386,32 @@ def detect_project_layers(root: Path) -> list:
     docker_compose = _search(root, ['docker-compose.yml', 'docker-compose.yaml'])
     if docker_compose:
         add_layer('Infrastructure', docker_compose.parent, 'Docker/Compose',
-            f"Study the infrastructure of '{root.name}' at: {docker_compose.parent}\n\n"
-            f"Tasks:\n"
+            f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Infrastructure layer of this project.\n\n"
+            f"WHY this matters: Your findings will be used to generate C4 architecture diagrams showing all deployable services and their relationships. Each service you identify becomes a node in the container diagram.\n\n"
+            f"Your task: Analyze the Infrastructure layer at {docker_compose.parent}.\n\n"
+            f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+            f"1. All services defined in docker-compose.yml with their roles\n"
+            f"2. The role of each service (database/cache/queue/proxy/app)\n"
+            f"3. Service dependencies (depends_on, network connections)\n"
+            f"4. Image names and versions for each service\n\n"
+            f"ANALYSIS STEPS:\n"
             f"1. Read docker-compose.yml — list ALL services with their roles\n"
             f"2. For each service identify: its role (database/cache/queue/proxy/app), image name\n"
             f"3. Map service dependencies (depends_on, networks)\n\n"
-            f"IMPORTANT for key_components: return ONLY objects with short 'name' (service name from docker-compose, e.g. 'postgres', 'redis', 'nginx', 'backend'). "
-            f"Do NOT include image versions, ports, or descriptions in the name field — those go in 'purpose'.\n\n"
-            f"Return JSON: tech, description, "
-            f"key_components[{{\"name\": \"<short-service-name>\", \"image\": \"<image>\", \"purpose\": \"<one sentence>\"}}], "
-            f"external_deps[{{name,type,label}}]\n\n"
-            f"Example key_components: [{{\"name\": \"postgres\", \"image\": \"postgres:15\", \"purpose\": \"primary database\"}}, "
-            f"{{\"name\": \"redis\", \"image\": \"redis:7\", \"purpose\": \"session cache\"}}]"
+            f"OUTPUT FORMAT:\n"
+            f"<findings>\n"
+            f"{{{{\n"
+            f'  "layer": "Infrastructure",\n'
+            f'  "tech": "Docker/Compose",\n'
+            f'  "description": "One sentence: what infrastructure this compose file defines",\n'
+            f'  "key_components": [{{"name": "postgres", "image": "postgres:15", "purpose": "primary database"}}, {{"name": "redis", "image": "redis:7", "purpose": "session cache"}}],\n'
+            f'  "external_deps": []\n'
+            f"}}}}\n"
+            f"</findings>\n\n"
+            f"CONSTRAINTS:\n"
+            f"- key_components[].name: ONLY the short service name from docker-compose (e.g. 'postgres', 'redis', 'nginx')\n"
+            f"- Do NOT include image versions, ports, or descriptions in the name field — those go in 'image' and 'purpose'\n"
+            f"- description: one sentence maximum"
         )
 
     # ── Fallback: generic scan ──
@@ -2167,31 +2422,69 @@ def detect_project_layers(root: Path) -> list:
             'path': str(root),
             'tech': 'Unknown',
             'agent_prompt': (
-                f"Study the project '{root.name}' at: {root}\n"
+                f"You are a code architecture analyst. Your job is to produce a precise JSON findings object for the Project layer of this project.\n\n"
+                f"WHY this matters: Your findings will be used to generate C4 architecture diagrams and navigation context files that help AI assistants navigate this codebase efficiently. Incomplete or vague findings produce unusable diagrams.\n\n"
+                f"Your task: Analyze the project '{root.name}' at {root}.\n"
                 f"Directories: {', '.join(subs[:20])}\n\n"
-                f"Tasks:\n"
-                f"1. Identify the technology stack and framework\n"
+                f"SUCCESS CRITERIA — your output is complete when you have identified:\n"
+                f"1. The technology stack and primary framework\n"
+                f"2. The main architectural layers and their purposes\n"
+                f"3. Key components with their roles\n"
+                f"4. External dependencies (databases, APIs, services)\n\n"
+                f"ANALYSIS STEPS:\n"
+                f"1. Identify the technology stack and framework from config files\n"
                 f"2. Map the main architectural layers\n"
                 f"3. List key components with their purpose\n"
                 f"4. Find external dependencies (databases, APIs, services)\n"
                 f"5. Map component relationships\n\n"
-                f"Return JSON: tech, description, key_components[] (SHORT names ONLY: AuthHandler, UserService, MailRepo. Max 25 chars. NO descriptions in name), component_relationships[{{from,to,label}}] (real call graph: which component calls which), external_deps[{{name,type,label}}] (only real DBs/queues/APIs/services), api_endpoints[], key_flows[{{title, steps[{{from,to,message,response}}]}}] (top 2 key flows)"
+                f"OUTPUT FORMAT — return exactly this JSON structure:\n"
+                f"<findings>\n"
+                f"{{{{\n"
+                f'  "layer": "Project",\n'
+                f'  "tech": "Framework, Language, Key Libraries",\n'
+                f'  "description": "One sentence: what this project does and its main purpose",\n'
+                f'  "key_components": ["ComponentName1", "ComponentName2"],\n'
+                f'  "component_relationships": [{{"from": "ComponentA", "to": "ComponentB", "label": "calls"}}],\n'
+                f'  "external_deps": [{{"name": "PostgreSQL", "type": "database", "label": "reads/writes data"}}],\n'
+                f'  "api_endpoints": [],\n'
+                f'  "key_flows": [{{"title": "Flow name", "steps": [{{"from": "Client", "to": "Handler", "message": "request", "response": "result"}}]}}]\n'
+                f"}}}}\n"
+                f"</findings>\n\n"
+                f"CONSTRAINTS:\n"
+                f"- key_components: list 10-15 items, use exact class/file names found in the code (max 25 chars each)\n"
+                f"- tech: include version numbers where visible in config files\n"
+                f"- description: one sentence maximum\n"
+                f"- external_deps: only real DBs/queues/APIs/services — verify by reading actual config files"
             ),
         })
 
     return layers
 
 
-# ─────────────────────────────────────────────
-# NEW MCP TOOLS
-# ─────────────────────────────────────────────
-
-@mcp.tool()
 def ndoc_explore(project_path: str = "") -> str:
     """
-    Scans project structure and returns instructions to launch an Agent Team.
-    Each agent studies its own architectural layer in parallel.
-    After all agents finish — call ndoc_generate with their combined findings.
+    Detect architectural layers in a project and return structured prompts for spawning parallel research agents that will analyze each layer deeply.
+
+    Use this tool as the FIRST STEP of a two-step workflow when ndoc_init produces low-quality context (shallow function lists). It returns agent instructions — you must then spawn agents using those instructions, collect their JSON findings, and pass them to ndoc_generate.
+
+    Do NOT use if ndoc_init already produced good context.md files with full function signatures and dependency maps.
+    Do NOT skip the agent spawning step — ndoc_explore only detects layers, ndoc_generate does the writing.
+
+    Workflow:
+    1. Call ndoc_explore → get layer detection + agent prompts
+    2. Spawn one agent per layer (in parallel if possible)
+    3. Each agent returns a JSON findings object
+    4. Call ndoc_generate(findings=<combined JSON>) to write everything
+
+    Parameters:
+    - project_path: Path to project root. Leave empty ("") to use WORKSPACE_ROOT or current directory.
+
+    Returns:
+    - Detected architectural layers (Backend/Frontend/Infrastructure/etc.)
+    - One agent prompt per layer with instructions for deep analysis
+    - Expected JSON output format for agent findings
+
+    Caveats: Layer detection is heuristic (checks for framework-specific files). May misclassify hybrid stacks. Works best on standard Laravel/Django/React/Go/Next.js projects.
     """
     root = resolve_path(project_path)
     if not root.exists():
@@ -2285,12 +2578,31 @@ def ndoc_explore(project_path: str = "") -> str:
     return '\n'.join(out)
 
 
-@mcp.tool()
 def ndoc_generate(project_path: str = "", findings: str = "") -> str:
     """
-    Generates context.md files and C4 diagrams based on Agent Team findings.
-    findings: JSON string with architectural description from agents (output of ndoc_explore flow).
-    If findings is empty — use ndoc_init for basic initialization instead.
+    Generate enriched context.md files and context.index.md with full C4 architecture diagrams (Context, Container, Component levels) from agent research findings.
+
+    Use this tool as the SECOND STEP after ndoc_explore — after parallel agents have analyzed each architectural layer and returned JSON findings.
+
+    Do NOT call without findings JSON — it will fall back to basic ndoc_init behavior.
+    Do NOT pass findings from a different project.
+
+    Parameters:
+    - project_path: Path to project root. Leave empty ("") to use WORKSPACE_ROOT or current directory.
+    - findings: JSON string containing agent research results. Expected structure:
+      {
+        "architecture_type": "monolith|microservices|fullstack",
+        "layers": [{"name": "Backend", "tech": "Laravel 9, PHP 8.1", "description": "...", "key_components": ["LoginController", "UserService"]}],
+        "modules": [{"name": "Auth", "layer": "Backend", "dependencies": ["Database", "Redis"]}],
+        "cross_layer_relations": [{"from": "Frontend", "to": "Backend", "protocol": "HTTP/JSON", "description": "API calls"}]
+      }
+
+    Returns:
+    - Confirmation of files written: context.md in all code directories, context.index.md with C4 diagrams.
+    - Warning messages for detected conflicts (e.g., multiple databases claimed by different agents).
+    - Summary of C4 diagram levels generated (Context/Container/Component).
+
+    Caveats: Database conflict detection is heuristic — review the warning section manually if multiple DB systems are flagged. C4 diagrams are generated from findings + static code scan; accuracy depends on agent research quality.
     """
     root = resolve_path(project_path)
     if not root.exists():
@@ -2411,7 +2723,7 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
     out.append("Step 1/4 — Static scan...")
     dirs_with_code = []
     all_dirs = set()
-    for dp, subdirs, files in os.walk(root):
+    for dp, subdirs, files in os.walk(root, followlinks=False):
         subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
         dp = Path(dp)
         if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files):
