@@ -60,7 +60,8 @@ SKIP_DIRS = {
     '.vscode', 'coverage', '.cache', 'tmp', 'logs',
 }
 
-CODE_EXTENSIONS = {'.py', '.js', '.ts', '.jsx', '.tsx', '.go'}
+CODE_EXTENSIONS = {'.py', '.js', '.ts', '.jsx', '.tsx', '.go',
+                   '.php', '.rb', '.java', '.cs', '.swift', '.kt', '.kts', '.rs'}
 
 _MINIFIED_RE = re.compile(
     r'(\.min\.|[.\-]bundle\.|[.\-]bundle-|-bundle\b)',
@@ -316,6 +317,216 @@ def parse_go(filepath: Path) -> dict:
 
 
 # ─────────────────────────────────────────────
+# PHP PARSER
+# ─────────────────────────────────────────────
+
+def parse_php(filepath: Path) -> dict:
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return {'functions': [], 'imports': []}
+    functions = []
+    imports = []
+    try:
+        for m in re.finditer(r'(?:abstract\s+|final\s+)?class\s+(\w+)', content):
+            functions.append(m.group(1))
+        for m in re.finditer(r'(?:public|protected|private)(?:\s+static)?\s+function\s+(\w+)\s*\(([^)]*)\)', content):
+            name = m.group(1)
+            params = m.group(2).strip()
+            param_list = []
+            for p in params.split(','):
+                p = p.strip()
+                pm = re.search(r'\$(\w+)', p)
+                if pm:
+                    param_list.append('$' + pm.group(1))
+            sig = f"{name}({', '.join(param_list)})"
+            functions.append(sig)
+        for m in re.finditer(r'^use\s+([\w\\]+)(?:\s+as\s+\w+)?;', content, re.MULTILINE):
+            parts = m.group(1).split('\\')
+            imports.append(parts[-1])
+    except Exception:
+        pass
+    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+
+
+# ─────────────────────────────────────────────
+# RUBY PARSER
+# ─────────────────────────────────────────────
+
+def parse_ruby(filepath: Path) -> dict:
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return {'functions': [], 'imports': []}
+    functions = []
+    imports = []
+    try:
+        for m in re.finditer(r'^class\s+(\w+)', content, re.MULTILINE):
+            functions.append(m.group(1))
+        for m in re.finditer(r'^\s*def\s+(\w+)\s*(?:\(([^)]*)\))?', content, re.MULTILINE):
+            name = m.group(1)
+            params = (m.group(2) or '').strip()
+            functions.append(f"{name}({params})" if params else name)
+        for m in re.finditer(r'^require(?:_relative)?\s+[\'"]([^\'"]+)[\'"]', content, re.MULTILINE):
+            imports.append(Path(m.group(1)).stem)
+    except Exception:
+        pass
+    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+
+
+# ─────────────────────────────────────────────
+# JAVA PARSER
+# ─────────────────────────────────────────────
+
+def parse_java(filepath: Path) -> dict:
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return {'functions': [], 'imports': []}
+    functions = []
+    imports = []
+    try:
+        for m in re.finditer(r'(?:public|private|protected)?\s*(?:abstract\s+)?class\s+(\w+)', content):
+            functions.append(m.group(1))
+        for m in re.finditer(r'(?:public|private|protected)(?:\s+static)?(?:\s+final)?\s+\w[\w<>,\s]*\s+(\w+)\s*\(([^)]*)\)', content):
+            name = m.group(1)
+            params = m.group(2).strip()
+            param_parts = []
+            for p in params.split(','):
+                p = p.strip()
+                parts = p.split()
+                if len(parts) >= 2:
+                    param_parts.append(parts[-2])
+            functions.append(f"{name}({', '.join(param_parts)})")
+        for m in re.finditer(r'^import\s+(?:static\s+)?([\w.]+);', content, re.MULTILINE):
+            parts = m.group(1).split('.')
+            imports.append(parts[-1])
+    except Exception:
+        pass
+    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+
+
+# ─────────────────────────────────────────────
+# C# PARSER
+# ─────────────────────────────────────────────
+
+def parse_csharp(filepath: Path) -> dict:
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return {'functions': [], 'imports': []}
+    functions = []
+    imports = []
+    try:
+        for m in re.finditer(r'(?:public|internal|private|protected)?\s*(?:abstract\s+|sealed\s+)?class\s+(\w+)', content):
+            functions.append(m.group(1))
+        for m in re.finditer(r'(?:public|private|protected|internal)(?:\s+static)?(?:\s+async)?\s+\w[\w<>?,\s]*\s+(\w+)\s*\(([^)]*)\)', content):
+            name = m.group(1)
+            params = m.group(2).strip()
+            param_parts = []
+            for p in params.split(','):
+                p = p.strip()
+                parts = p.split()
+                if len(parts) >= 2:
+                    param_parts.append(parts[0])
+            functions.append(f"{name}({', '.join(param_parts)})")
+        for m in re.finditer(r'^using\s+([\w.]+);', content, re.MULTILINE):
+            parts = m.group(1).split('.')
+            imports.append(parts[-1])
+    except Exception:
+        pass
+    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+
+
+# ─────────────────────────────────────────────
+# SWIFT PARSER
+# ─────────────────────────────────────────────
+
+def parse_swift(filepath: Path) -> dict:
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return {'functions': [], 'imports': []}
+    functions = []
+    imports = []
+    try:
+        for m in re.finditer(r'(?:class|struct|enum|protocol)\s+(\w+)', content):
+            functions.append(m.group(1))
+        for m in re.finditer(r'func\s+(\w+)\s*\(([^)]*)\)', content):
+            name = m.group(1)
+            params = m.group(2).strip()
+            param_parts = [p.split(':')[0].strip() for p in params.split(',') if ':' in p]
+            functions.append(f"{name}({', '.join(param_parts)})")
+        for m in re.finditer(r'^import\s+(\w+)', content, re.MULTILINE):
+            imports.append(m.group(1))
+    except Exception:
+        pass
+    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+
+
+# ─────────────────────────────────────────────
+# KOTLIN PARSER
+# ─────────────────────────────────────────────
+
+def parse_kotlin(filepath: Path) -> dict:
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return {'functions': [], 'imports': []}
+    functions = []
+    imports = []
+    try:
+        for m in re.finditer(r'(?:class|object|interface|data class)\s+(\w+)', content):
+            functions.append(m.group(1))
+        for m in re.finditer(r'fun\s+(\w+)\s*\(([^)]*)\)', content):
+            name = m.group(1)
+            params = m.group(2).strip()
+            param_parts = []
+            for p in params.split(','):
+                p = p.strip()
+                if ':' in p:
+                    param_parts.append(p.split(':')[0].strip())
+            functions.append(f"{name}({', '.join(param_parts)})")
+        for m in re.finditer(r'^import\s+([\w.]+)', content, re.MULTILINE):
+            parts = m.group(1).split('.')
+            imports.append(parts[-1])
+    except Exception:
+        pass
+    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+
+
+# ─────────────────────────────────────────────
+# RUST PARSER
+# ─────────────────────────────────────────────
+
+def parse_rust(filepath: Path) -> dict:
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return {'functions': [], 'imports': []}
+    functions = []
+    imports = []
+    try:
+        for m in re.finditer(r'(?:pub\s+)?struct\s+(\w+)', content):
+            functions.append(m.group(1))
+        for m in re.finditer(r'(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*\(([^)]*)\)', content):
+            name = m.group(1)
+            params = m.group(2).strip()
+            param_parts = []
+            for p in params.split(','):
+                p = p.strip()
+                if ':' in p:
+                    param_parts.append(p.split(':')[0].strip().lstrip('&mut ').lstrip('&'))
+            functions.append(f"{name}({', '.join(param_parts)})")
+        for m in re.finditer(r'^use\s+([\w:]+)', content, re.MULTILINE):
+            parts = re.split(r'[::]', m.group(1))
+            imports.append(parts[-1])
+    except Exception:
+        pass
+    return {'functions': list(dict.fromkeys(functions)), 'imports': list(dict.fromkeys(imports))}
+
+
+# ─────────────────────────────────────────────
 # DISPATCH
 # ─────────────────────────────────────────────
 
@@ -327,6 +538,20 @@ def parse_file(filepath: Path) -> dict:
         return parse_js_ts(filepath)
     elif ext == '.go':
         return parse_go(filepath)
+    elif ext == '.php':
+        return parse_php(filepath)
+    elif ext == '.rb':
+        return parse_ruby(filepath)
+    elif ext == '.java':
+        return parse_java(filepath)
+    elif ext == '.cs':
+        return parse_csharp(filepath)
+    elif ext == '.swift':
+        return parse_swift(filepath)
+    elif ext in ('.kt', '.kts'):
+        return parse_kotlin(filepath)
+    elif ext == '.rs':
+        return parse_rust(filepath)
     return {'functions': [], 'imports': []}
 
 
