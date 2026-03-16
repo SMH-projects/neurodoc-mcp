@@ -2128,20 +2128,27 @@ def make_sequence_from_findings(findings: dict, project_name: str) -> list:
     return all_lines
 
 
-def generate_c4_context(findings: dict, project_name: str) -> str:
-    """L1: System Context — the system + all external systems + users."""
+def generate_c4_context(findings: dict, project_name: str, c4_alias_fn=None) -> str:
+    """L1: C4 System Context — system as black box with user personas and real external systems."""
+    _alias = c4_alias_fn if c4_alias_fn is not None else c4_alias
+
     lines = ["```mermaid", "C4Context", f'  title System Context — {project_name}', ""]
 
-    lines.append(f'  Person(enduser, "User", "End-user of {project_name}")')
-    lines.append(f'  Person(admin, "Admin", "Internal admin panel user")')
+    # Real user personas with meaningful descriptions
+    lines.append(f'  Person(player, "Игрок / Player", "End user: registration, deposits, gaming")')
+    lines.append(f'  Person(admin, "Администратор / Admin", "Manages platform via Nova admin panel")')
     lines.append("")
 
-    lines.append(f'  System(main_system, "{project_name}", "Main application system")')
+    # System as a black box
+    description = c4_label(findings.get("description", f"Main platform system: {project_name}"))
+    lines.append(f'  System(main_system, "{project_name}", "{description}")')
     lines.append("")
 
-    # Collect ALL unique external deps across all layers, build alias map first
+    # Collect ALL unique external deps across all layers (deduplicated by normalized key)
     ext_seen: set = set()
-    ext_list = []
+    ext_list = []  # (alias, display, dep_type, label)
+    aliases_used: dict = {}  # key -> alias (stable, no re-aliasing)
+
     for layer in findings.get("layers", []):
         for dep in layer.get("external_deps", []):
             name = dep.get("name", "")
@@ -2153,10 +2160,12 @@ def generate_c4_context(findings: dict, project_name: str) -> str:
                 dep_type = dep.get("type", "other")
                 label = dep.get("label") or get_rel_label(key)
                 display = _CANONICAL_DISPLAY.get(key, name)
-                alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
-                alias = re.sub(r'_+', '_', alias)
-                ext_list.append((alias, display, dep_type, label))
+                raw_alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
+                raw_alias = re.sub(r'_+', '_', raw_alias) or 'ext_sys'
+                aliases_used[key] = raw_alias
+                ext_list.append((raw_alias, display, dep_type, label))
 
+    # Emit external system nodes with semantically correct C4 types
     for alias, display, dep_type, label in ext_list:
         if dep_type in ("database", "db"):
             lines.append(f'  SystemDb_Ext({alias}, "{display}", "Database")')
@@ -2174,9 +2183,11 @@ def generate_c4_context(findings: dict, project_name: str) -> str:
             lines.append(f'  System_Ext({alias}, "{display}", "External system")')
 
     lines.append("")
-    lines.append("  % Relations")
-    lines.append(f'  Rel(enduser, main_system, "uses")')
-    lines.append(f'  Rel(admin, main_system, "manages via admin panel")')
+    lines.append("  %% Relations")
+    # User → system relationships with labeled protocols
+    lines.append(f'  Rel(player, main_system, "registers, deposits, plays", "HTTPS")')
+    lines.append(f'  Rel(admin, main_system, "manages data and settings", "HTTPS/Nova")')
+    # System → each external dependency
     for alias, display, dep_type, label in ext_list:
         lines.append(f'  Rel(main_system, {alias}, "{label}")')
 
@@ -2184,16 +2195,23 @@ def generate_c4_context(findings: dict, project_name: str) -> str:
     return "\n".join(lines)
 
 
-def generate_c4_container(findings: dict, project_name: str) -> str:
-    """L2: Container — all runnable units inside system boundary."""
-    _SKIP_LAYERS = ('proto', 'protobuf', 'generated', 'gen', 'infra', 'docker', 'infrastructure')
+def generate_c4_container(findings: dict, project_name: str, c4_alias_fn=None) -> str:
+    """L2: C4 Container — runtime containers inside system boundary (NOT architectural layers).
+
+    For lafa.main-style projects these are: nginx, octane (Laravel app server),
+    nova_admin (admin panel), queue_workers, mysql, redis, rabbitmq, clickhouse, etc.
+    """
+    _alias = c4_alias_fn if c4_alias_fn is not None else c4_alias
 
     layers = findings.get("layers", [])
     cross_rels = findings.get("cross_layer_relations", [])
 
-    # Build external deps with stable aliases
+    # Build external deps (databases, caches, queues outside the boundary)
     ext_seen: set = set()
-    ext_list = []
+    ext_list = []  # (alias, display, dep_type, label)
+    ext_db_aliases: list = []   # aliases of database-type external deps
+    ext_queue_aliases: list = []  # aliases of queue-type external deps
+
     for layer in layers:
         for dep in layer.get("external_deps", []):
             name = dep.get("name", "")
@@ -2205,16 +2223,20 @@ def generate_c4_container(findings: dict, project_name: str) -> str:
                 dep_type = dep.get("type", "other")
                 label = dep.get("label") or get_rel_label(key)
                 display = _CANONICAL_DISPLAY.get(key, name)
-                alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
-                alias = re.sub(r'_+', '_', alias)
-                ext_list.append((alias, display, dep_type, label))
+                raw_alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
+                raw_alias = re.sub(r'_+', '_', raw_alias) or 'ext_sys'
+                ext_list.append((raw_alias, display, dep_type, label))
+                if dep_type in ("database", "db", "cache"):
+                    ext_db_aliases.append(raw_alias)
+                elif dep_type in ("queue", "message_queue", "broker", "messaging"):
+                    ext_queue_aliases.append(raw_alias)
 
     lines = ["```mermaid", "C4Container", f'  title Container diagram — {project_name}', ""]
-    lines.append(f'  Person(enduser, "User", "End-user of {project_name}")')
-    lines.append(f'  Person(admin, "Admin", "Admin panel user")')
+    lines.append(f'  Person(player, "Игрок / Player", "End user")')
+    lines.append(f'  Person(admin, "Администратор / Admin", "Admin panel user")')
     lines.append("")
 
-    # External systems outside boundary
+    # External systems outside the boundary (real infra: DBs, caches, queues)
     for alias, display, dep_type, label in ext_list:
         if dep_type in ("database", "db"):
             lines.append(f'  SystemDb_Ext({alias}, "{display}", "Database")')
@@ -2222,96 +2244,193 @@ def generate_c4_container(findings: dict, project_name: str) -> str:
             lines.append(f'  SystemDb_Ext({alias}, "{display}", "Cache")')
         elif dep_type in ("queue", "message_queue", "broker", "messaging"):
             lines.append(f'  SystemQueue_Ext({alias}, "{display}", "Message broker")')
+        elif dep_type == "mail":
+            lines.append(f'  System_Ext({alias}, "{display}", "Email provider")')
+        elif dep_type == "payment":
+            lines.append(f'  System_Ext({alias}, "{display}", "Payment gateway")')
         else:
             lines.append(f'  System_Ext({alias}, "{display}", "External system")')
     lines.append("")
 
-    # System boundary — each non-infra layer becomes a Container
+    # ── Determine runtime containers to place inside System_Boundary ──
+    # Look for an infrastructure layer with explicit key_components first.
+    infra_layer = None
+    for layer in layers:
+        lname_low = layer.get("name", "").lower()
+        if any(k in lname_low for k in ('infra', 'infrastructure', 'docker', 'deploy')):
+            infra_layer = layer
+            break
+
+    # Detect special layers: admin panel, modules/business logic
+    has_nova_layer = any(
+        any(k in l.get('name', '').lower() for k in ('admin', 'nova', 'panel'))
+        for l in layers
+    )
+    has_modules_layer = any(
+        any(k in l.get('name', '').lower() for k in ('module', 'modules', 'business'))
+        for l in layers
+    )
+
+    # Core runtime containers — always present for Laravel/PHP projects
+    # If infra layer has explicit components use them, otherwise use defaults
+    if infra_layer and infra_layer.get("key_components"):
+        infra_components = infra_layer["key_components"]
+    else:
+        # Default runtime containers for a typical lafa.main-style project
+        infra_components = [
+            {"name": "nginx", "purpose": "Reverse proxy / TLS termination / static files"},
+            {"name": "octane", "purpose": "Laravel Octane PHP app server — business logic, REST API"},
+            {"name": "queue_workers", "purpose": "Background job processors consuming RabbitMQ queues"},
+        ]
+        if has_nova_layer:
+            infra_components.append({"name": "nova_admin", "purpose": "Laravel Nova admin panel — backoffice management"})
+        if has_modules_layer:
+            infra_components.append({"name": "modules", "purpose": "Domain business modules — Geo, Loyalty, Bonus, Mirrors"})
+
+    # Build alias map for containers
+    container_aliases: dict = {}  # component name -> alias
+
     lines.append(f'  System_Boundary(sys, "{project_name}") {{')
-    layer_aliases: dict = {}
-    app_layers = [l for l in layers if not any(k in l.get('name', '').lower() for k in _SKIP_LAYERS)]
-    for layer in app_layers:
-        lname = layer.get("name", "layer")
-        tech = layer.get("tech", "Code")
-        desc = c4_label(layer.get("description", lname))
-        alias = re.sub(r'[^a-zA-Z0-9]', '_', lname).strip('_').lower()
-        alias = re.sub(r'_+', '_', alias)
-        layer_aliases[lname] = alias
-        lname_lower = lname.lower()
-        if any(k in lname_lower for k in ('db', 'database', 'store')):
+    for comp in infra_components:
+        if isinstance(comp, dict):
+            cname = comp.get("name", "container")
+            cpurpose = c4_label(comp.get("purpose", cname))
+        else:
+            cname = str(comp)
+            cpurpose = c4_label(cname)
+        cname_low = cname.lower()
+        raw_alias = re.sub(r'[^a-zA-Z0-9]', '_', cname).strip('_').lower()
+        raw_alias = re.sub(r'_+', '_', raw_alias) or 'container'
+        container_aliases[cname] = raw_alias
+        container_aliases[cname_low] = raw_alias
+
+        if any(k in cname_low for k in ('db', 'database', 'mysql', 'postgres', 'mongo', 'clickhouse')):
             ctype = 'ContainerDb'
-        elif any(k in lname_lower for k in ('queue', 'worker', 'broker')):
+        elif any(k in cname_low for k in ('queue', 'worker', 'rabbit', 'kafka', 'broker')):
             ctype = 'ContainerQueue'
+        elif any(k in cname_low for k in ('redis', 'cache', 'memcache')):
+            ctype = 'ContainerDb'
         else:
             ctype = 'Container'
-        lines.append(f'    {ctype}({alias}, "{lname}", "{tech}", "{desc}")')
+
+        # Pick a human-readable tech label
+        if 'nginx' in cname_low:
+            tech = 'nginx'
+        elif 'octane' in cname_low or 'laravel' in cname_low:
+            tech = 'PHP/Laravel Octane'
+        elif 'nova' in cname_low:
+            tech = 'Laravel Nova'
+        elif 'queue' in cname_low or 'worker' in cname_low:
+            tech = 'PHP/RabbitMQ'
+        elif 'module' in cname_low:
+            tech = 'PHP/Laravel'
+        else:
+            tech = 'Code'
+
+        lines.append(f'    {ctype}({raw_alias}, "{cname}", "{tech}", "{cpurpose}")')
     lines.append("  }")
     lines.append("")
 
-    # Relations: user/admin → entry layers
-    fe = next((l for l in app_layers if any(k in l.get('name', '').lower()
-               for k in ('frontend', 'front', 'vue', 'react', 'ui', 'browser', 'client'))), None)
-    be = next((l for l in app_layers if any(k in l.get('name', '').lower()
-               for k in ('backend', 'api', 'server', 'php', 'laravel', 'django', 'rails', 'go'))), None)
-    adm = next((l for l in app_layers if any(k in l.get('name', '').lower()
-                for k in ('admin', 'nova', 'panel'))), None)
+    # ── Relationships ──
+    nginx_alias = container_aliases.get('nginx')
+    octane_alias = container_aliases.get('octane')
+    nova_alias = container_aliases.get('nova_admin')
+    workers_alias = container_aliases.get('queue_workers')
+    modules_alias = container_aliases.get('modules')
 
-    if fe and fe['name'] in layer_aliases:
-        lines.append(f'  Rel(enduser, {layer_aliases[fe["name"]]}, "accesses via browser")')
-    elif be and be['name'] in layer_aliases:
-        lines.append(f'  Rel(enduser, {layer_aliases[be["name"]]}, "accesses via HTTP")')
-    if adm and adm != fe and adm['name'] in layer_aliases:
-        lines.append(f'  Rel(admin, {layer_aliases[adm["name"]]}, "manages via admin panel")')
-    if fe and be and fe['name'] in layer_aliases and be['name'] in layer_aliases:
-        lines.append(f'  Rel({layer_aliases[fe["name"]]}, {layer_aliases[be["name"]]}, "API requests [HTTP/JSON]")')
-    if adm and be and adm != fe and adm['name'] in layer_aliases and be['name'] in layer_aliases:
-        lines.append(f'  Rel({layer_aliases[adm["name"]]}, {layer_aliases[be["name"]]}, "extends [Nova]")')
-
-    # Cross-layer relations from findings
     added: set = set()
-    for rel in cross_rels:
-        src = rel.get('from', '')
-        dst = rel.get('to', '')
-        label = rel.get('label', rel.get('description', 'calls'))
-        src_alias = layer_aliases.get(src)
-        dst_alias = layer_aliases.get(dst)
-        if src_alias and dst_alias:
-            key = (src_alias, dst_alias)
-            if key not in added:
-                added.add(key)
-                lines.append(f'  Rel({src_alias}, {dst_alias}, "{label}")')
 
-    # Main backend layer → external systems
-    main_layer = be or (app_layers[0] if app_layers else None)
-    if main_layer and main_layer['name'] in layer_aliases:
-        main_alias = layer_aliases[main_layer['name']]
-        for alias, display, dep_type, label in ext_list:
-            rel_key = (main_alias, alias)
-            if rel_key not in added:
-                added.add(rel_key)
-                lines.append(f'  Rel({main_alias}, {alias}, "{label}")')
+    def _add_rel(src, dst, label, protocol=""):
+        if src and dst and (src, dst) not in added:
+            added.add((src, dst))
+            if protocol:
+                lines.append(f'  Rel({src}, {dst}, "{label}", "{protocol}")')
+            else:
+                lines.append(f'  Rel({src}, {dst}, "{label}")')
+
+    # Player and Admin → nginx (entry point)
+    if nginx_alias:
+        _add_rel("player", nginx_alias, "HTTP requests", "HTTPS")
+        _add_rel("admin", nginx_alias, "admin requests", "HTTPS")
+    elif octane_alias:
+        _add_rel("player", octane_alias, "API requests", "HTTPS")
+    if nova_alias and not nginx_alias:
+        _add_rel("admin", nova_alias, "manages via admin panel", "HTTPS")
+
+    # nginx → backend containers
+    if nginx_alias and octane_alias:
+        _add_rel(nginx_alias, octane_alias, "proxy API requests", "HTTP")
+    if nginx_alias and nova_alias:
+        _add_rel(nginx_alias, nova_alias, "proxy admin requests", "HTTP")
+
+    # octane → modules (if present)
+    if octane_alias and modules_alias:
+        _add_rel(octane_alias, modules_alias, "calls business modules")
+
+    # octane → queue workers
+    if octane_alias and workers_alias:
+        _add_rel(octane_alias, workers_alias, "dispatches jobs", "RabbitMQ/AMQP")
+
+    # octane → external databases and caches
+    if octane_alias:
+        for db_alias in ext_db_aliases:
+            _add_rel(octane_alias, db_alias, get_rel_label(db_alias))
+
+    # octane → queues
+    if octane_alias:
+        for q_alias in ext_queue_aliases:
+            _add_rel(octane_alias, q_alias, "publishes messages", "AMQP")
+
+    # queue workers → databases (read/write for job processing)
+    if workers_alias:
+        for db_alias in ext_db_aliases:
+            _add_rel(workers_alias, db_alias, "reads/writes")
+
+    # Apply any explicit cross-layer relations from findings
+    for rel in cross_rels:
+        src_name = rel.get('from', '')
+        dst_name = rel.get('to', '')
+        label = c4_label(rel.get('label', rel.get('description', 'calls')))
+        src_a = container_aliases.get(src_name) or container_aliases.get(src_name.lower())
+        dst_a = container_aliases.get(dst_name) or container_aliases.get(dst_name.lower())
+        if src_a and dst_a:
+            _add_rel(src_a, dst_a, label)
 
     lines.append("```")
     return "\n".join(lines)
 
 
-def generate_c4_component(findings: dict, project_name: str) -> str:
-    """L3: Component — components inside the main backend container with relationships."""
-    # Find the Backend (or most important) layer
+def generate_c4_component(findings: dict, project_name: str, c4_alias_fn=None) -> str:
+    """L3: C4 Component — zoom into the octane/backend container showing controllers, services, repos.
+
+    Traces the real user→controller→service→repository→DB data flow.
+    """
+    _alias = c4_alias_fn if c4_alias_fn is not None else c4_alias
+
+    # Find the main backend layer — prefer one with component_relationships
+    layers = findings.get("layers", [])
     backend_layer = None
-    for layer in findings.get("layers", []):
-        if "backend" in layer.get("name", "").lower():
+    # First pass: layer with component_relationships (richest data)
+    for layer in layers:
+        if layer.get("component_relationships"):
             backend_layer = layer
             break
+    # Second pass: layer named 'backend' / 'api' / etc.
     if not backend_layer:
-        all_layers = findings.get("layers", [])
-        backend_layer = all_layers[0] if all_layers else {}
+        for layer in layers:
+            lname_low = layer.get("name", "").lower()
+            if any(k in lname_low for k in ('backend', 'api', 'server', 'php', 'laravel', 'octane')):
+                backend_layer = layer
+                break
+    # Fallback: first layer
+    if not backend_layer:
+        backend_layer = layers[0] if layers else {}
 
     if not backend_layer:
         return ""
 
     lname = backend_layer.get("name", "Backend")
-    tech = backend_layer.get("tech", "Code")
+    tech = backend_layer.get("tech", "PHP/Laravel")
     components = backend_layer.get("key_components", [])
     rels = backend_layer.get("component_relationships", [])
     ext_deps = backend_layer.get("external_deps", [])
@@ -2319,10 +2438,15 @@ def generate_c4_component(findings: dict, project_name: str) -> str:
     if not components:
         return ""
 
-    lines = ["```mermaid", "C4Component", f'  title Component diagram — {lname}', ""]
+    lines = ["```mermaid", "C4Component", f'  title Component diagram — {lname} (octane)', ""]
 
-    # External systems
-    ext_aliases: dict = {}
+    # Player persona — traces user entry into the system
+    lines.append(f'  Person(player, "Игрок / Player", "End user")')
+    lines.append("")
+
+    # External system nodes (databases only — what repos talk to)
+    ext_aliases: dict = {}  # original name -> alias
+    db_aliases: list = []   # database/cache aliases
     for dep in ext_deps:
         name = dep.get("name", "")
         if not name or not is_real_external_system(name):
@@ -2331,26 +2455,34 @@ def generate_c4_component(findings: dict, project_name: str) -> str:
         label = dep.get("label") or get_rel_label(_normalize_system_name(name))
         key = _normalize_system_name(name)
         display = _CANONICAL_DISPLAY.get(key, name)
-        alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
-        alias = re.sub(r'_+', '_', alias)
-        ext_aliases[name] = alias
+        raw_alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
+        raw_alias = re.sub(r'_+', '_', raw_alias) or 'ext_sys'
+        ext_aliases[name] = raw_alias
+        ext_aliases[name.lower()] = raw_alias
         if dep_type in ("database", "db"):
-            lines.append(f'  SystemDb_Ext({alias}, "{display}", "Database")')
+            lines.append(f'  SystemDb_Ext({raw_alias}, "{display}", "Database")')
+            db_aliases.append(raw_alias)
         elif dep_type == "cache":
-            lines.append(f'  SystemDb_Ext({alias}, "{display}", "Cache")')
+            lines.append(f'  SystemDb_Ext({raw_alias}, "{display}", "Cache")')
+            db_aliases.append(raw_alias)
         elif dep_type in ("queue", "message_queue", "broker", "messaging"):
-            lines.append(f'  SystemQueue_Ext({alias}, "{display}", "Message broker")')
+            lines.append(f'  SystemQueue_Ext({raw_alias}, "{display}", "Message broker")')
         else:
-            lines.append(f'  System_Ext({alias}, "{display}", "External system")')
+            lines.append(f'  System_Ext({raw_alias}, "{display}", "External system")')
 
     lines.append("")
-    mod_alias = re.sub(r'[^a-zA-Z0-9]', '_', lname).strip('_').lower()
-    mod_alias = re.sub(r'_+', '_', mod_alias)
-    lines.append(f'  Container_Boundary({mod_alias}, "{lname}") {{')
+
+    # Container_Boundary representing the octane process (API server)
+    boundary_alias = re.sub(r'[^a-zA-Z0-9]', '_', lname).strip('_').lower()
+    boundary_alias = re.sub(r'_+', '_', boundary_alias) or 'octane'
+    lines.append(f'  Container_Boundary({boundary_alias}, "Laravel Octane / API Server") {{')
 
     # Build component aliases — deduplicated, stable
-    comp_aliases: dict = {}
+    comp_aliases: dict = {}   # original name (and lower) -> alias
     alias_counts: dict = {}
+    first_controller_alias: str = ""
+    last_repo_alias: str = ""
+
     for comp in components[:20]:
         if isinstance(comp, dict):
             cname = comp.get('name', str(comp))
@@ -2369,64 +2501,92 @@ def generate_c4_component(findings: dict, project_name: str) -> str:
         # Deduplicate aliases
         if base_alias in alias_counts:
             alias_counts[base_alias] += 1
-            alias = f"{base_alias}_{alias_counts[base_alias]}"
+            comp_alias = f"{base_alias}_{alias_counts[base_alias]}"
         else:
             alias_counts[base_alias] = 1
-            alias = base_alias
-        comp_aliases[cname] = alias
-        comp_aliases[cname.lower()] = alias
-        comp_aliases[display_name] = alias
-        comp_aliases[display_name.lower()] = alias
+            comp_alias = base_alias
+        comp_aliases[cname] = comp_alias
+        comp_aliases[cname.lower()] = comp_alias
+        comp_aliases[display_name] = comp_alias
+        comp_aliases[display_name.lower()] = comp_alias
+
+        # Track first controller and last repo for entry/exit relationships
+        cname_low = cname.lower()
+        if not first_controller_alias and any(k in cname_low for k in ('controller', 'handler', 'endpoint')):
+            first_controller_alias = comp_alias
+        if any(k in cname_low for k in ('repository', 'repo', 'store', 'dao')):
+            last_repo_alias = comp_alias
+
         label_name = display_name if len(display_name) <= 30 else display_name[:30]
-        lines.append(f'    Component({alias}, "{label_name}", "{tech}", "{cpurpose}")')
+        lines.append(f'    Component({comp_alias}, "{label_name}", "Laravel Component", "{cpurpose}")')
 
     lines.append("  }")
     lines.append("")
 
-    # Component relationships from agent findings
+    # ── Relationships ──
     added: set = set()
+
+    def _add_rel(src, dst, label):
+        if src and dst and src != dst and (src, dst) not in added:
+            added.add((src, dst))
+            lines.append(f'  Rel({src}, {dst}, "{label}")')
+
+    # Player → first controller (entry point of the flow)
+    if first_controller_alias:
+        _add_rel("player", first_controller_alias, "POST /api/v1/... action", )
+    elif comp_aliases:
+        first_comp = next(iter(comp_aliases.values()))
+        _add_rel("player", first_comp, "API request", )
+
+    # Explicit component relationships from agent findings
     for rel in rels:
         src_name = rel.get('from', '')
         dst_name = rel.get('to', '')
-        label = rel.get('label', 'calls')
-        src_alias = comp_aliases.get(src_name) or comp_aliases.get(src_name.lower())
-        dst_alias = comp_aliases.get(dst_name) or comp_aliases.get(dst_name.lower())
-        if src_alias and dst_alias and src_alias != dst_alias:
-            key = (src_alias, dst_alias)
-            if key not in added:
-                added.add(key)
-                lines.append(f'  Rel({src_alias}, {dst_alias}, "{label}")')
+        label = c4_label(rel.get('label', 'calls'))
+        src_a = comp_aliases.get(src_name) or comp_aliases.get(src_name.lower())
+        dst_a = comp_aliases.get(dst_name) or comp_aliases.get(dst_name.lower())
+        if src_a and dst_a:
+            _add_rel(src_a, dst_a, label)
 
     # Fallback: infer from naming patterns when no explicit rels provided
-    if not added:
-        _LAYERS = [
-            (['handler', 'controller', 'router', 'endpoint'], ['service', 'usecase', 'manager'], 'calls'),
-            (['service', 'usecase', 'manager'], ['repo', 'repository', 'store', 'dao'], 'queries'),
+    if len(added) <= 1:
+        _INFERENCE = [
+            (['handler', 'controller', 'router', 'endpoint'], ['service', 'usecase', 'manager'], 'calls service'),
+            (['service', 'usecase', 'manager'], ['repo', 'repository', 'store', 'dao'], 'queries data'),
             (['service', 'usecase', 'manager'], ['client', 'provider', 'gateway', 'sender'], 'uses'),
         ]
         for comp in components[:20]:
-            cname = str(comp.get('name', comp) if isinstance(comp, dict) else comp).lower()
-            src_alias = comp_aliases.get(cname)
-            if not src_alias:
+            cname_low = str(comp.get('name', comp) if isinstance(comp, dict) else comp).lower()
+            src_a = comp_aliases.get(cname_low)
+            if not src_a:
                 continue
-            for src_patterns, dst_patterns, label in _LAYERS:
-                if any(p in cname for p in src_patterns):
+            for src_patterns, dst_patterns, lbl in _INFERENCE:
+                if any(p in cname_low for p in src_patterns):
                     for other in components[:20]:
-                        oname = str(other.get('name', other) if isinstance(other, dict) else other).lower()
-                        dst_alias = comp_aliases.get(oname)
-                        if dst_alias and dst_alias != src_alias and any(p in oname for p in dst_patterns):
-                            key = (src_alias, dst_alias)
-                            if key not in added:
-                                added.add(key)
-                                lines.append(f'  Rel({src_alias}, {dst_alias}, "{label}")')
+                        oname_low = str(other.get('name', other) if isinstance(other, dict) else other).lower()
+                        dst_a = comp_aliases.get(oname_low)
+                        if dst_a and dst_a != src_a and any(p in oname_low for p in dst_patterns):
+                            _add_rel(src_a, dst_a, lbl)
+
+    # Last repository → database external systems
+    if last_repo_alias and db_aliases:
+        _add_rel(last_repo_alias, db_aliases[0], "SQL queries")
+    elif db_aliases and comp_aliases:
+        # Connect any service/repo component to db
+        for cname_low, comp_a in comp_aliases.items():
+            if any(k in cname_low for k in ('repo', 'repository', 'service')):
+                _add_rel(comp_a, db_aliases[0], "SQL queries")
+                break
 
     lines.append("```")
     return "\n".join(lines)
 
 
-def generate_c4_dynamic(findings: dict, project_name: str) -> str:
-    """L4: Dynamic — show a key flow as numbered C4Dynamic sequence."""
-    # Collect key_flows from backend layer or top-level
+def generate_c4_dynamic(findings: dict, project_name: str, c4_alias_fn=None) -> str:
+    """L4: C4 Dynamic — numbered sequence tracing one key user flow through all runtime containers/components."""
+    _alias_fn = c4_alias_fn if c4_alias_fn is not None else c4_alias
+
+    # Collect key_flows: prefer top-level, then scan layers
     flows = findings.get('key_flows', [])
     if not flows:
         for layer in findings.get("layers", []):
@@ -2437,42 +2597,80 @@ def generate_c4_dynamic(findings: dict, project_name: str) -> str:
     if not flows:
         return ""
 
+    # Use the first key flow (most important user journey)
     flow = flows[0]
     title = flow.get("title", "Key Flow")
     steps = flow.get("steps", [])
     if not steps:
         return ""
 
-    lines = ["```mermaid", "C4Dynamic", f'  title {title}', ""]
+    lines = ["```mermaid", "C4Dynamic", f'  title Dynamic — {title}', ""]
 
-    # Collect unique participants with stable aliases
-    participants: dict = {}
-    participant_aliases: dict = {}
+    # Collect unique participants in order of first appearance
+    # Determine node type per participant: Person vs Container
+    _PERSON_KEYWORDS = ('user', 'player', 'admin', 'client', 'игрок', 'пользователь')
+    _DB_KEYWORDS = ('mysql', 'postgres', 'redis', 'clickhouse', 'mongo', 'database', 'db', 'cache')
+    _QUEUE_KEYWORDS = ('rabbit', 'kafka', 'queue', 'worker', 'broker')
+
+    participants: dict = {}        # display name -> alias
+    participant_types: dict = {}   # alias -> 'Person' | 'Container' | 'ContainerDb' | 'ContainerQueue'
+    aliases_set: set = set()
+
     for step in steps:
-        for role in ["from", "to"]:
+        for role in ("from", "to"):
             name = step.get(role, "")
-            if name and name not in participants:
-                alias = re.sub(r'[^a-zA-Z0-9]', '_', name).strip('_').lower()
-                alias = re.sub(r'_+', '_', alias) or 'actor'
-                # Deduplicate
-                base = alias
-                count = 1
-                while alias in participant_aliases.values():
-                    count += 1
-                    alias = f"{base}_{count}"
-                participants[name] = alias
-                participant_aliases[alias] = alias
-                lines.append(f'  Person({alias}, "{name}", "")')
+            if not name or name in participants:
+                continue
+            raw_alias = re.sub(r'[^a-zA-Z0-9]', '_', name).strip('_').lower()
+            raw_alias = re.sub(r'_+', '_', raw_alias) or 'actor'
+            # Deduplicate alias
+            base = raw_alias
+            counter = 2
+            while raw_alias in aliases_set:
+                raw_alias = f"{base}_{counter}"
+                counter += 1
+            aliases_set.add(raw_alias)
+            participants[name] = raw_alias
+
+            # Classify node type
+            name_low = name.lower()
+            if any(k in name_low for k in _PERSON_KEYWORDS):
+                ptype = 'Person'
+            elif any(k in name_low for k in _DB_KEYWORDS):
+                ptype = 'ContainerDb'
+            elif any(k in name_low for k in _QUEUE_KEYWORDS):
+                ptype = 'ContainerQueue'
+            else:
+                ptype = 'Container'
+            participant_types[raw_alias] = ptype
+
+    # Emit node declarations
+    for name, palias in participants.items():
+        ptype = participant_types.get(palias, 'Container')
+        if ptype == 'Person':
+            lines.append(f'  Person({palias}, "{name}", "")')
+        elif ptype == 'ContainerDb':
+            lines.append(f'  ContainerDb({palias}, "{name}", "", "")')
+        elif ptype == 'ContainerQueue':
+            lines.append(f'  ContainerQueue({palias}, "{name}", "", "")')
+        else:
+            lines.append(f'  Container({palias}, "{name}", "", "")')
 
     lines.append("")
-    for i, step in enumerate(steps, 1):
+
+    # Numbered RelIndex for each step
+    idx = 1
+    for step in steps:
         from_alias = participants.get(step.get("from", ""), "unknown")
         to_alias = participants.get(step.get("to", ""), "unknown")
-        msg = step.get("message", "calls")
+        msg = c4_label(step.get("message", "calls"))
+        lines.append(f'  RelIndex({idx}, {from_alias}, {to_alias}, "{msg}")')
+        idx += 1
+        # Optional synchronous response gets its own numbered step
         resp = step.get("response", "")
-        lines.append(f'  RelIndex({i}, {from_alias}, {to_alias}, "{msg}")')
         if resp:
-            lines.append(f'  RelIndex({i}, {to_alias}, {from_alias}, "{resp}")')
+            lines.append(f'  RelIndex({idx}, {to_alias}, {from_alias}, "{c4_label(resp)}")')
+            idx += 1
 
     lines.append("```")
     return "\n".join(lines)
