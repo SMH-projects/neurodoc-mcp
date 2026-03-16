@@ -1762,6 +1762,11 @@ def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
     _QUEUE = {'queue', 'broker', 'messaging'}
     _CACHE = {'cache'}
 
+    # Build alias map FIRST so Rel() reuses the same IDs (fixes ID mismatch bug)
+    alias_map: dict = {}
+    for key in ext_deps:
+        alias_map[key] = c4_alias(key)
+
     lines = [
         '```mermaid', 'C4Context',
         f'  title System Context — {project_name}', '',
@@ -1770,7 +1775,7 @@ def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
         '',
     ]
     for key, info in list(ext_deps.items())[:12]:
-        alias = c4_alias(key)
+        alias = alias_map[key]
         display = info['display']
         dep_type = info['type'].lower()
         if dep_type in _DB:
@@ -1790,7 +1795,7 @@ def make_c4_context_from_findings(findings: dict, project_name: str) -> list:
     lines.append('')
     lines.append(f'  Rel(user, {proj}, "uses")')
     for key, info in list(ext_deps.items())[:12]:
-        lines.append(f'  Rel({proj}, {c4_alias(key)}, "{info["label"]}")')
+        lines.append(f'  Rel({proj}, {alias_map[key]}, "{info["label"]}")')
     lines.append('```')
     return lines
 
@@ -2121,6 +2126,356 @@ def make_sequence_from_findings(findings: dict, project_name: str) -> list:
         all_lines += ['', f'### Sequence: {title}', ''] + lines
 
     return all_lines
+
+
+def generate_c4_context(findings: dict, project_name: str) -> str:
+    """L1: System Context — the system + all external systems + users."""
+    lines = ["```mermaid", "C4Context", f'  title System Context — {project_name}', ""]
+
+    lines.append(f'  Person(enduser, "User", "End-user of {project_name}")')
+    lines.append(f'  Person(admin, "Admin", "Internal admin panel user")')
+    lines.append("")
+
+    lines.append(f'  System(main_system, "{project_name}", "Main application system")')
+    lines.append("")
+
+    # Collect ALL unique external deps across all layers, build alias map first
+    ext_seen: set = set()
+    ext_list = []
+    for layer in findings.get("layers", []):
+        for dep in layer.get("external_deps", []):
+            name = dep.get("name", "")
+            if not name or not is_real_external_system(name):
+                continue
+            key = _normalize_system_name(name)
+            if key not in ext_seen:
+                ext_seen.add(key)
+                dep_type = dep.get("type", "other")
+                label = dep.get("label") or get_rel_label(key)
+                display = _CANONICAL_DISPLAY.get(key, name)
+                alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
+                alias = re.sub(r'_+', '_', alias)
+                ext_list.append((alias, display, dep_type, label))
+
+    for alias, display, dep_type, label in ext_list:
+        if dep_type in ("database", "db"):
+            lines.append(f'  SystemDb_Ext({alias}, "{display}", "Database")')
+        elif dep_type == "cache":
+            lines.append(f'  SystemDb_Ext({alias}, "{display}", "Cache")')
+        elif dep_type in ("queue", "message_queue", "broker", "messaging"):
+            lines.append(f'  SystemQueue_Ext({alias}, "{display}", "Message broker")')
+        elif dep_type == "mail":
+            lines.append(f'  System_Ext({alias}, "{display}", "Email provider")')
+        elif dep_type == "monitoring":
+            lines.append(f'  System_Ext({alias}, "{display}", "Monitoring")')
+        elif dep_type == "payment":
+            lines.append(f'  System_Ext({alias}, "{display}", "Payment gateway")')
+        else:
+            lines.append(f'  System_Ext({alias}, "{display}", "External system")')
+
+    lines.append("")
+    lines.append("  % Relations")
+    lines.append(f'  Rel(enduser, main_system, "uses")')
+    lines.append(f'  Rel(admin, main_system, "manages via admin panel")')
+    for alias, display, dep_type, label in ext_list:
+        lines.append(f'  Rel(main_system, {alias}, "{label}")')
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def generate_c4_container(findings: dict, project_name: str) -> str:
+    """L2: Container — all runnable units inside system boundary."""
+    _SKIP_LAYERS = ('proto', 'protobuf', 'generated', 'gen', 'infra', 'docker', 'infrastructure')
+
+    layers = findings.get("layers", [])
+    cross_rels = findings.get("cross_layer_relations", [])
+
+    # Build external deps with stable aliases
+    ext_seen: set = set()
+    ext_list = []
+    for layer in layers:
+        for dep in layer.get("external_deps", []):
+            name = dep.get("name", "")
+            if not name or not is_real_external_system(name):
+                continue
+            key = _normalize_system_name(name)
+            if key not in ext_seen:
+                ext_seen.add(key)
+                dep_type = dep.get("type", "other")
+                label = dep.get("label") or get_rel_label(key)
+                display = _CANONICAL_DISPLAY.get(key, name)
+                alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
+                alias = re.sub(r'_+', '_', alias)
+                ext_list.append((alias, display, dep_type, label))
+
+    lines = ["```mermaid", "C4Container", f'  title Container diagram — {project_name}', ""]
+    lines.append(f'  Person(enduser, "User", "End-user of {project_name}")')
+    lines.append(f'  Person(admin, "Admin", "Admin panel user")')
+    lines.append("")
+
+    # External systems outside boundary
+    for alias, display, dep_type, label in ext_list:
+        if dep_type in ("database", "db"):
+            lines.append(f'  SystemDb_Ext({alias}, "{display}", "Database")')
+        elif dep_type == "cache":
+            lines.append(f'  SystemDb_Ext({alias}, "{display}", "Cache")')
+        elif dep_type in ("queue", "message_queue", "broker", "messaging"):
+            lines.append(f'  SystemQueue_Ext({alias}, "{display}", "Message broker")')
+        else:
+            lines.append(f'  System_Ext({alias}, "{display}", "External system")')
+    lines.append("")
+
+    # System boundary — each non-infra layer becomes a Container
+    lines.append(f'  System_Boundary(sys, "{project_name}") {{')
+    layer_aliases: dict = {}
+    app_layers = [l for l in layers if not any(k in l.get('name', '').lower() for k in _SKIP_LAYERS)]
+    for layer in app_layers:
+        lname = layer.get("name", "layer")
+        tech = layer.get("tech", "Code")
+        desc = c4_label(layer.get("description", lname))
+        alias = re.sub(r'[^a-zA-Z0-9]', '_', lname).strip('_').lower()
+        alias = re.sub(r'_+', '_', alias)
+        layer_aliases[lname] = alias
+        lname_lower = lname.lower()
+        if any(k in lname_lower for k in ('db', 'database', 'store')):
+            ctype = 'ContainerDb'
+        elif any(k in lname_lower for k in ('queue', 'worker', 'broker')):
+            ctype = 'ContainerQueue'
+        else:
+            ctype = 'Container'
+        lines.append(f'    {ctype}({alias}, "{lname}", "{tech}", "{desc}")')
+    lines.append("  }")
+    lines.append("")
+
+    # Relations: user/admin → entry layers
+    fe = next((l for l in app_layers if any(k in l.get('name', '').lower()
+               for k in ('frontend', 'front', 'vue', 'react', 'ui', 'browser', 'client'))), None)
+    be = next((l for l in app_layers if any(k in l.get('name', '').lower()
+               for k in ('backend', 'api', 'server', 'php', 'laravel', 'django', 'rails', 'go'))), None)
+    adm = next((l for l in app_layers if any(k in l.get('name', '').lower()
+                for k in ('admin', 'nova', 'panel'))), None)
+
+    if fe and fe['name'] in layer_aliases:
+        lines.append(f'  Rel(enduser, {layer_aliases[fe["name"]]}, "accesses via browser")')
+    elif be and be['name'] in layer_aliases:
+        lines.append(f'  Rel(enduser, {layer_aliases[be["name"]]}, "accesses via HTTP")')
+    if adm and adm != fe and adm['name'] in layer_aliases:
+        lines.append(f'  Rel(admin, {layer_aliases[adm["name"]]}, "manages via admin panel")')
+    if fe and be and fe['name'] in layer_aliases and be['name'] in layer_aliases:
+        lines.append(f'  Rel({layer_aliases[fe["name"]]}, {layer_aliases[be["name"]]}, "API requests [HTTP/JSON]")')
+    if adm and be and adm != fe and adm['name'] in layer_aliases and be['name'] in layer_aliases:
+        lines.append(f'  Rel({layer_aliases[adm["name"]]}, {layer_aliases[be["name"]]}, "extends [Nova]")')
+
+    # Cross-layer relations from findings
+    added: set = set()
+    for rel in cross_rels:
+        src = rel.get('from', '')
+        dst = rel.get('to', '')
+        label = rel.get('label', rel.get('description', 'calls'))
+        src_alias = layer_aliases.get(src)
+        dst_alias = layer_aliases.get(dst)
+        if src_alias and dst_alias:
+            key = (src_alias, dst_alias)
+            if key not in added:
+                added.add(key)
+                lines.append(f'  Rel({src_alias}, {dst_alias}, "{label}")')
+
+    # Main backend layer → external systems
+    main_layer = be or (app_layers[0] if app_layers else None)
+    if main_layer and main_layer['name'] in layer_aliases:
+        main_alias = layer_aliases[main_layer['name']]
+        for alias, display, dep_type, label in ext_list:
+            rel_key = (main_alias, alias)
+            if rel_key not in added:
+                added.add(rel_key)
+                lines.append(f'  Rel({main_alias}, {alias}, "{label}")')
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def generate_c4_component(findings: dict, project_name: str) -> str:
+    """L3: Component — components inside the main backend container with relationships."""
+    # Find the Backend (or most important) layer
+    backend_layer = None
+    for layer in findings.get("layers", []):
+        if "backend" in layer.get("name", "").lower():
+            backend_layer = layer
+            break
+    if not backend_layer:
+        all_layers = findings.get("layers", [])
+        backend_layer = all_layers[0] if all_layers else {}
+
+    if not backend_layer:
+        return ""
+
+    lname = backend_layer.get("name", "Backend")
+    tech = backend_layer.get("tech", "Code")
+    components = backend_layer.get("key_components", [])
+    rels = backend_layer.get("component_relationships", [])
+    ext_deps = backend_layer.get("external_deps", [])
+
+    if not components:
+        return ""
+
+    lines = ["```mermaid", "C4Component", f'  title Component diagram — {lname}', ""]
+
+    # External systems
+    ext_aliases: dict = {}
+    for dep in ext_deps:
+        name = dep.get("name", "")
+        if not name or not is_real_external_system(name):
+            continue
+        dep_type = dep.get("type", "other")
+        label = dep.get("label") or get_rel_label(_normalize_system_name(name))
+        key = _normalize_system_name(name)
+        display = _CANONICAL_DISPLAY.get(key, name)
+        alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
+        alias = re.sub(r'_+', '_', alias)
+        ext_aliases[name] = alias
+        if dep_type in ("database", "db"):
+            lines.append(f'  SystemDb_Ext({alias}, "{display}", "Database")')
+        elif dep_type == "cache":
+            lines.append(f'  SystemDb_Ext({alias}, "{display}", "Cache")')
+        elif dep_type in ("queue", "message_queue", "broker", "messaging"):
+            lines.append(f'  SystemQueue_Ext({alias}, "{display}", "Message broker")')
+        else:
+            lines.append(f'  System_Ext({alias}, "{display}", "External system")')
+
+    lines.append("")
+    mod_alias = re.sub(r'[^a-zA-Z0-9]', '_', lname).strip('_').lower()
+    mod_alias = re.sub(r'_+', '_', mod_alias)
+    lines.append(f'  Container_Boundary({mod_alias}, "{lname}") {{')
+
+    # Build component aliases — deduplicated, stable
+    comp_aliases: dict = {}
+    alias_counts: dict = {}
+    for comp in components[:20]:
+        if isinstance(comp, dict):
+            cname = comp.get('name', str(comp))
+            cpurpose = c4_label(comp.get('purpose', cname))
+        else:
+            cname = str(comp)
+            cpurpose = c4_label(cname)
+        if not cname:
+            continue
+        display_name = cname
+        if len(cname) > 30:
+            short = re.split(r'[\s\u2014\-,:(]', cname)[0].strip()
+            display_name = short if len(short) >= 3 else cname[:25]
+        base_alias = re.sub(r'[^a-zA-Z0-9]', '_', display_name).strip('_').lower()
+        base_alias = re.sub(r'_+', '_', base_alias) or 'comp'
+        # Deduplicate aliases
+        if base_alias in alias_counts:
+            alias_counts[base_alias] += 1
+            alias = f"{base_alias}_{alias_counts[base_alias]}"
+        else:
+            alias_counts[base_alias] = 1
+            alias = base_alias
+        comp_aliases[cname] = alias
+        comp_aliases[cname.lower()] = alias
+        comp_aliases[display_name] = alias
+        comp_aliases[display_name.lower()] = alias
+        label_name = display_name if len(display_name) <= 30 else display_name[:30]
+        lines.append(f'    Component({alias}, "{label_name}", "{tech}", "{cpurpose}")')
+
+    lines.append("  }")
+    lines.append("")
+
+    # Component relationships from agent findings
+    added: set = set()
+    for rel in rels:
+        src_name = rel.get('from', '')
+        dst_name = rel.get('to', '')
+        label = rel.get('label', 'calls')
+        src_alias = comp_aliases.get(src_name) or comp_aliases.get(src_name.lower())
+        dst_alias = comp_aliases.get(dst_name) or comp_aliases.get(dst_name.lower())
+        if src_alias and dst_alias and src_alias != dst_alias:
+            key = (src_alias, dst_alias)
+            if key not in added:
+                added.add(key)
+                lines.append(f'  Rel({src_alias}, {dst_alias}, "{label}")')
+
+    # Fallback: infer from naming patterns when no explicit rels provided
+    if not added:
+        _LAYERS = [
+            (['handler', 'controller', 'router', 'endpoint'], ['service', 'usecase', 'manager'], 'calls'),
+            (['service', 'usecase', 'manager'], ['repo', 'repository', 'store', 'dao'], 'queries'),
+            (['service', 'usecase', 'manager'], ['client', 'provider', 'gateway', 'sender'], 'uses'),
+        ]
+        for comp in components[:20]:
+            cname = str(comp.get('name', comp) if isinstance(comp, dict) else comp).lower()
+            src_alias = comp_aliases.get(cname)
+            if not src_alias:
+                continue
+            for src_patterns, dst_patterns, label in _LAYERS:
+                if any(p in cname for p in src_patterns):
+                    for other in components[:20]:
+                        oname = str(other.get('name', other) if isinstance(other, dict) else other).lower()
+                        dst_alias = comp_aliases.get(oname)
+                        if dst_alias and dst_alias != src_alias and any(p in oname for p in dst_patterns):
+                            key = (src_alias, dst_alias)
+                            if key not in added:
+                                added.add(key)
+                                lines.append(f'  Rel({src_alias}, {dst_alias}, "{label}")')
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def generate_c4_dynamic(findings: dict, project_name: str) -> str:
+    """L4: Dynamic — show a key flow as numbered C4Dynamic sequence."""
+    # Collect key_flows from backend layer or top-level
+    flows = findings.get('key_flows', [])
+    if not flows:
+        for layer in findings.get("layers", []):
+            layer_flows = layer.get('key_flows', [])
+            if layer_flows:
+                flows = layer_flows
+                break
+    if not flows:
+        return ""
+
+    flow = flows[0]
+    title = flow.get("title", "Key Flow")
+    steps = flow.get("steps", [])
+    if not steps:
+        return ""
+
+    lines = ["```mermaid", "C4Dynamic", f'  title {title}', ""]
+
+    # Collect unique participants with stable aliases
+    participants: dict = {}
+    participant_aliases: dict = {}
+    for step in steps:
+        for role in ["from", "to"]:
+            name = step.get(role, "")
+            if name and name not in participants:
+                alias = re.sub(r'[^a-zA-Z0-9]', '_', name).strip('_').lower()
+                alias = re.sub(r'_+', '_', alias) or 'actor'
+                # Deduplicate
+                base = alias
+                count = 1
+                while alias in participant_aliases.values():
+                    count += 1
+                    alias = f"{base}_{count}"
+                participants[name] = alias
+                participant_aliases[alias] = alias
+                lines.append(f'  Person({alias}, "{name}", "")')
+
+    lines.append("")
+    for i, step in enumerate(steps, 1):
+        from_alias = participants.get(step.get("from", ""), "unknown")
+        to_alias = participants.get(step.get("to", ""), "unknown")
+        msg = step.get("message", "calls")
+        resp = step.get("response", "")
+        lines.append(f'  RelIndex({i}, {from_alias}, {to_alias}, "{msg}")')
+        if resp:
+            lines.append(f'  RelIndex({i}, {to_alias}, {from_alias}, "{resp}")')
+
+    lines.append("```")
+    return "\n".join(lines)
 
 
 def _search(root: Path, names: list, max_depth: int = 2) -> Path | None:
@@ -3117,60 +3472,69 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
         index_lines.append(line)
     index_lines.append("")
 
-    # C4 Context (from agent findings)
-    index_lines.append("## C4 Context")
+    # ── 4-level C4 diagrams from agent findings ──
+    c4_context_str = generate_c4_context(data, project_name) if layers_info else \
+        "\n".join(make_c4_context(modules, project_name, all_module_names))
+    c4_container_str = generate_c4_container(data, project_name) if layers_info else \
+        "\n".join(make_c4_container(modules, project_name, root))
+    c4_component_str = generate_c4_component(data, project_name)
+    c4_dynamic_str = generate_c4_dynamic(data, project_name)
+
+    # C4 Context (Level 1)
+    index_lines.append("## C4 Context (Level 1)")
     index_lines.append("")
-    if layers_info:
-        index_lines += make_c4_context_from_findings(data, project_name)
-    else:
-        index_lines += make_c4_context(modules, project_name, all_module_names)
+    index_lines.append(c4_context_str)
     index_lines.append("")
 
-    # C4 Container (from agent findings)
-    index_lines.append("## C4 Container")
+    # C4 Container (Level 2)
+    index_lines.append("## C4 Container (Level 2)")
     index_lines.append("")
-    if layers_info:
-        index_lines += make_c4_container_from_findings(data, project_name)
-    else:
-        index_lines += make_c4_container(modules, project_name, root)
+    index_lines.append(c4_container_str)
+    index_lines.append("")
 
-    # C4 Component — one diagram per non-infra layer that has key_components
+    # C4 Component — Backend (Level 3)
+    if c4_component_str:
+        index_lines.append("## C4 Component — Backend (Level 3)")
+        index_lines.append("")
+        index_lines.append(c4_component_str)
+        index_lines.append("")
+
+    # C4 Dynamic — Key Flow (Level 4)
+    if c4_dynamic_str:
+        index_lines.append("## C4 Dynamic — Key Flow (Level 4)")
+        index_lines.append("")
+        index_lines.append(c4_dynamic_str)
+        index_lines.append("")
+
+    # Also generate per-layer Component diagrams for non-backend layers
     if layers_info:
-        comp_sections = []
-        _SKIP = ('proto', 'protobuf', 'generated', 'gen', 'infra', 'docker', 'infrastructure')
+        _SKIP = ('proto', 'protobuf', 'generated', 'gen', 'infra', 'docker', 'infrastructure', 'backend')
         for layer in layers_info:
-            if any(k in layer.get('name', '').lower() for k in _SKIP):
+            lname = layer.get('name', '')
+            if any(k in lname.lower() for k in _SKIP):
                 continue
             comp_lines = make_c4_component_from_findings(layer)
             if comp_lines:
-                comp_sections.append(('## C4 Component — ' + layer['name'], comp_lines))
-        if comp_sections:
-            for section_title, comp_lines in comp_sections:
-                index_lines.append("")
-                index_lines.append(section_title)
+                index_lines.append(f"## C4 Component — {lname}")
                 index_lines.append("")
                 index_lines += comp_lines
+                index_lines.append("")
 
     # Sequence diagrams (from agent findings)
-    if data.get('key_flows'):
-        index_lines.append("")
-        index_lines.append("## Key Flows")
-        index_lines += make_sequence_from_findings(data, project_name)
-
-    # Also collect key_flows from individual layers
-    layer_flows = []
+    # Collect key_flows: top-level and per-layer
+    all_flows = list(data.get('key_flows', []))
     for layer in layers_info:
         for flow in layer.get('key_flows', []):
-            layer_flows.append(flow)
-    if layer_flows and not data.get('key_flows'):
+            all_flows.append(flow)
+    if all_flows:
         data_with_flows = dict(data)
-        data_with_flows['key_flows'] = layer_flows
-        index_lines.append("")
+        data_with_flows['key_flows'] = all_flows
         index_lines.append("## Key Flows")
         index_lines += make_sequence_from_findings(data_with_flows, project_name)
+        index_lines.append("")
 
     (root / 'context.index.md').write_text('\n'.join(index_lines), encoding='utf-8')
-    out.append("   ok: context.index.md written with C4 Context + C4 Container + C4 Component from agent findings")
+    out.append("   ok: context.index.md written with C4 Context + Container + Component + Dynamic (4 levels)")
 
     # ── Step 4: Update CLAUDE.md ──
     out.append("\nStep 4/4 — Updating CLAUDE.md...")
@@ -3192,8 +3556,8 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
         "NeuroDoc Generate complete!",
         "",
         f"   {generated} context.md files",
-        f"   context.index.md with C4 Context + C4 Container",
-        f"   C4 diagrams built from Agent Team findings",
+        f"   context.index.md with C4 Context + Container + Component + Dynamic (4 levels)",
+        f"   C4 diagrams built from Agent Team findings (proper relationships, no ID mismatches)",
         f"   CLAUDE.md updated",
     ]
 
