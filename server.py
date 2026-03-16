@@ -4062,13 +4062,9 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
     for dp, subdirs, files in os.walk(root, followlinks=False):
         subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
         dp = Path(dp)
+        all_dirs.add(dp)  # every directory gets a context.md
         if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files):
             dirs_with_code.append(dp)
-            parent = dp.parent
-            while parent != root.parent:
-                all_dirs.add(parent)
-                parent = parent.parent
-    all_dirs.update(dirs_with_code)
     all_dirs.add(root)
 
     all_module_names = [short_name(d, root) for d in all_dirs]
