@@ -1207,39 +1207,88 @@ def make_c4_component(mod: str, files_data: dict) -> list:
 # CONTEXT.MD GENERATORS
 # ─────────────────────────────────────────────
 
+def _infer_purpose(dir_path: Path, root: Path) -> str:
+    """Infer a one-line purpose description from the directory name/path."""
+    parts = dir_path.parts
+    name = dir_path.name
+
+    # Check path parts for known patterns
+    path_str = str(dir_path)
+
+    if 'nova-components' in path_str or 'nova_components' in path_str:
+        return f"Custom Laravel Nova admin panel component: {name}"
+    if 'app/Http/Controllers' in path_str or 'Http/Controllers' in path_str:
+        return f"HTTP API controllers grouped by domain: {name}"
+    if 'app/Services' in path_str or '/Services' in path_str:
+        return f"Application service layer: {name}"
+    if 'Modules/' in path_str:
+        # Extract module name
+        for part in parts:
+            if part == 'Modules':
+                idx = list(parts).index(part)
+                if idx + 1 < len(parts):
+                    domain = parts[idx + 1]
+                    return f"Bounded context module: {domain} domain"
+        return f"Bounded context module: {name}"
+
+    # Check directory name suffixes/keywords
+    name_lower = name.lower()
+    if 'controller' in name_lower:
+        return f"HTTP request handlers for {name} domain"
+    if 'service' in name_lower:
+        return f"Business logic layer for {name}"
+    if 'repository' in name_lower or 'repo' in name_lower:
+        return f"Data access layer — database queries for {name}"
+    if 'middleware' in name_lower:
+        return f"Request/response middleware for {name}"
+    if 'model' in name_lower:
+        return f"Eloquent models for {name} data"
+    if 'provider' in name_lower:
+        return f"Laravel service provider for {name}"
+    if 'resource' in name_lower:
+        return f"API resource transformers for {name}"
+    if 'migration' in name_lower:
+        return f"Database migrations for {name}"
+    if 'event' in name_lower:
+        return f"Domain events for {name}"
+    if 'listener' in name_lower:
+        return f"Event listeners for {name}"
+    if 'job' in name_lower:
+        return f"Async jobs/queue workers for {name}"
+    if 'observer' in name_lower:
+        return f"Eloquent model observers for {name}"
+    if 'policy' in name_lower:
+        return f"Authorization policies for {name}"
+    if 'request' in name_lower:
+        return f"Form request validators for {name}"
+    if 'command' in name_lower:
+        return f"Artisan console commands for {name}"
+    if 'test' in name_lower or 'spec' in name_lower:
+        return f"Test suite for {name}"
+    if 'helper' in name_lower or 'util' in name_lower:
+        return f"Utility helpers for {name}"
+    if 'config' in name_lower:
+        return f"Configuration files for {name}"
+
+    return f"Code module: {name}"
+
+
 def make_context_md(dir_path: Path, root: Path, all_modules: list, reverse_deps: dict = None) -> str:
     files_data = scan_dir(dir_path)
     mod = short_name(dir_path, root)
     now = datetime.now().strftime('%Y-%m-%d')
 
-    # Check for subdirs with code (always, not only when files_data is empty)
+    # Check for ALL immediate subdirs (not just those with code)
     children = child_subdirs_with_code(dir_path)
-
-    # Pure parent directory: no direct code files
-    if not files_data:
-        if children:
-            child_names = [c.name for c in children]
-            lines = [f"# {mod}", ""]
-            lines.append(f"**submodules:** {', '.join(child_names)}")
-            # Show what each child does if we can infer
-            for child in children[:8]:
-                child_data = scan_dir(child)
-                if child_data:
-                    child_funcs = []
-                    for fd in child_data.values():
-                        for fn in fd.get('functions', [])[:2]:
-                            child_funcs.append(fn['name'])
-                    if child_funcs:
-                        lines.append(f"- **{child.name}**: {', '.join(child_funcs[:4])}")
-                    else:
-                        lines.append(f"- **{child.name}**")
-            lines += [
-                "",
-                f"**tags:** {mod} {' '.join(child_names[:8])}",
-                f"**updated:** {now} ndoc",
-            ]
-            return '\n'.join(lines)
-        return f"# {mod}\n\n**tags:** {mod}\n**updated:** {now} ndoc"
+    # Also get truly all subdirs for parent-only directories
+    all_children = []
+    try:
+        all_children = sorted(
+            [item for item in dir_path.iterdir() if item.is_dir() and item.name not in SKIP_DIRS],
+            key=lambda p: p.name,
+        )
+    except PermissionError:
+        pass
 
     # Collect imports → compute module deps
     all_imports = []
@@ -1252,58 +1301,107 @@ def make_context_md(dir_path: Path, root: Path, all_modules: list, reverse_deps:
     if reverse_deps:
         used_by = reverse_deps.get(mod, [])
 
-    # Header: # module → dep1, dep2
+    # ── Header ──────────────────────────────────────────────────────────
     header = f"# {mod}"
     if deps:
         header += f" → {', '.join(deps)}"
-
     lines = [header, ""]
 
     if used_by:
         lines.append(f"**used by:** {', '.join(used_by)}")
         lines.append("")
 
-    # Per-file detailed sections
-    for fname, fd in files_data.items():
-        funcs = fd.get('functions', [])
-        if not funcs:
-            continue
+    # ── Purpose ─────────────────────────────────────────────────────────
+    purpose = _infer_purpose(dir_path, root)
+    lines.append("## Назначение (Purpose)")
+    lines.append("")
+    lines.append(purpose)
+    lines.append("")
 
-        lines.append(f"## {fname}")
-        for fn in funcs:
-            params = ', '.join(fn['params'])
-            entry = f"`{fn['name']}({params})`"
-            calls = fn.get('calls', [])
-            if calls:
-                entry += f" → {', '.join(calls)}"
-            lines.append(f"- {entry}")
+    # ── Files & Functions ────────────────────────────────────────────────
+    lines.append("## Файлы и функции")
+    lines.append("")
+
+    if files_data:
+        for fname, fd in sorted(files_data.items()):
+            funcs = fd.get('functions', [])
+            lines.append(f"### {fname}")
+            if not funcs:
+                lines.append("- (no public API)")
+            else:
+                for fn in funcs:
+                    params = ', '.join(fn['params'])
+                    calls = fn.get('calls', [])
+                    entry = f"- `{fn['name']}({params})`"
+                    if calls:
+                        entry += f" → {', '.join(calls)}"
+                    lines.append(entry)
+            lines.append("")
+    elif all_children:
+        # Parent-only dir: list subdirectories with a brief summary
+        for child in all_children[:12]:
+            child_data = scan_dir(child)
+            child_funcs = []
+            for fd in child_data.values():
+                for fn in fd.get('functions', [])[:2]:
+                    child_funcs.append(fn['name'])
+            if child_funcs:
+                lines.append(f"- **{child.name}/**: {', '.join(child_funcs[:4])}")
+            else:
+                has_any = any(True for _ in child.rglob('*') if _.is_file())
+                lines.append(f"- **{child.name}/**" + (" — (no code files)" if not has_any else ""))
+        lines.append("")
+    else:
+        lines.append("_No code files in this directory._")
         lines.append("")
 
-    # Submodules section
+    # ── Dependencies ─────────────────────────────────────────────────────
+    lines.append("## Зависимости (Dependencies)")
+    lines.append("")
+    if deps:
+        for dep in deps:
+            lines.append(f"- `../{dep}/` — {_infer_purpose(root / dep, root)}")
+    else:
+        lines.append("_No detected dependencies._")
+    lines.append("")
+
+    # ── Submodules ───────────────────────────────────────────────────────
     if children:
         child_names = [c.name for c in children]
         lines.append(f"**submodules:** {', '.join(child_names)}")
         lines.append("")
 
-    # Tags
-    tags = {mod}
+    # ── Tags ─────────────────────────────────────────────────────────────
+    tags: set = {mod}
     for d in deps:
         tags.add(d)
+    # Add name parts (split by CamelCase and underscores)
+    for part in re.split(r'[_\-/]', mod):
+        if len(part) >= 3:
+            tags.add(part.lower())
     for fname in files_data:
-        base = re.sub(r'\.(py|go|ts|js|tsx|jsx)$', '', fname)
-        tags.add(base)
+        base = re.sub(r'\.[a-z]+$', '', fname, flags=re.IGNORECASE)
+        for part in re.split(r'[_\-]', base):
+            if len(part) >= 3:
+                tags.add(part.lower())
     for fd in files_data.values():
-        for fn in fd.get('functions', [])[:3]:
+        for fn in fd.get('functions', [])[:4]:
             name = fn['name'].lower()
-            # Skip obfuscated/minified names (1-2 chars, or pure digits, or single-letter+digit)
+            # Skip obfuscated/minified names
             if len(name) >= 3 and not re.match(r'^[a-z]{1,2}\d*$', name):
                 tags.add(name)
+    for child in all_children[:6]:
+        if len(child.name) >= 3:
+            tags.add(child.name.lower())
 
     meaningful_tags = sorted(t for t in tags if len(t) >= 3)[:16]
-    lines.append(f"**tags:** {' '.join(meaningful_tags)}")
+    lines.append(f"## Теги")
+    lines.append("")
+    lines.append(', '.join(meaningful_tags))
+    lines.append("")
     lines.append(f"**updated:** {now} ndoc")
 
-    # C4 Component diagram
+    # ── C4 Component diagram (kept from original) ─────────────────────────
     c4_lines = make_c4_component(mod, files_data)
     if c4_lines:
         lines += ['', '## C4 Component', ''] + c4_lines
@@ -1495,12 +1593,12 @@ def ndoc(project_path: str = "", changed_files: str = "") -> str:
             if any(Path(f).suffix.lower() in CODE_EXTENSIONS for f in files):
                 dirs_with_code.append(dp)
 
+        # Include ALL subdirectories (not just those containing code),
+        # so every directory gets a context.md file.
         all_dirs = set(dirs_with_code)
-        for dp in dirs_with_code:
-            parent = dp.parent
-            while parent != root.parent and parent != root:
-                all_dirs.add(parent)
-                parent = parent.parent
+        for dp_str, subdirs, _ in os.walk(root, followlinks=False):
+            subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+            all_dirs.add(Path(dp_str))
         all_dirs.add(root)
 
         all_module_names = [short_name(d, root) for d in all_dirs]
