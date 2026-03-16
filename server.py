@@ -868,67 +868,72 @@ def is_real_external_system(name: str) -> bool:
 
 _REL_LABELS: dict = {
     # Databases
-    'postgres': 'reads/writes data',
-    'postgresql': 'reads/writes data',
-    'mysql': 'reads/writes data',
-    'mariadb': 'reads/writes data',
-    'mongodb': 'reads/writes data',
-    'mongo': 'reads/writes data',
-    'sqlite': 'reads/writes data',
-    'mssql': 'reads/writes data',
-    'dynamodb': 'reads/writes data',
-    'cassandra': 'reads/writes data',
+    'postgres': 'reads/writes',
+    'postgresql': 'reads/writes',
+    'mysql': 'reads/writes',
+    'mariadb': 'reads/writes',
+    'mongodb': 'reads/writes',
+    'mongo': 'reads/writes',
+    'sqlite': 'reads/writes',
+    'mssql': 'reads/writes',
+    'dynamodb': 'reads/writes',
+    'cassandra': 'reads/writes',
+    'clickhouse': 'OLAP events',
     # Cache
-    'redis': 'caches via',
-    'memcached': 'caches via',
-    'valkey': 'caches via',
+    'redis': 'cache/sessions',
+    'memcached': 'cache',
+    'valkey': 'cache',
     # HTTP / API
-    'axios': 'makes HTTP requests via',
-    'httpx': 'makes HTTP requests via',
-    'requests': 'makes HTTP requests via',
-    'got': 'makes HTTP requests via',
-    'superagent': 'makes HTTP requests via',
-    'guzzle': 'makes HTTP requests via',
+    'axios': 'HTTP requests',
+    'httpx': 'HTTP requests',
+    'requests': 'HTTP requests',
+    'got': 'HTTP requests',
+    'superagent': 'HTTP requests',
+    'guzzle': 'HTTP requests',
     # Auth
-    'jwt': 'authenticates via',
-    'passport': 'authenticates via',
-    'sanctum': 'authenticates via',
-    'oauth': 'authenticates via',
-    'auth': 'authenticates via',
+    'jwt': 'auth',
+    'passport': 'auth',
+    'sanctum': 'auth',
+    'oauth': 'auth',
+    'auth': 'auth',
     # Queues / workers
-    'kafka': 'publishes messages to',
-    'rabbitmq': 'publishes messages to',
-    'celery': 'enqueues tasks via',
-    'sqs': 'publishes messages to',
-    'bull': 'enqueues jobs via',
-    'beanstalkd': 'enqueues jobs via',
-    'horizon': 'manages queues via',
+    'kafka': 'event stream',
+    'rabbitmq': 'async jobs',
+    'celery': 'async tasks',
+    'sqs': 'async jobs',
+    'bull': 'async jobs',
+    'beanstalkd': 'async jobs',
+    'horizon': 'queue management',
     # Search
-    'elasticsearch': 'searches via',
-    'algolia': 'searches via',
-    'typesense': 'searches via',
-    'meilisearch': 'searches via',
-    'scout': 'searches via',
+    'elasticsearch': 'full-text search',
+    'algolia': 'search',
+    'typesense': 'search',
+    'meilisearch': 'search',
+    'scout': 'search',
     # Storage / CDN
-    's3': 'stores files in',
-    'cloudinary': 'stores media in',
-    'minio': 'stores files in',
-    'flysystem': 'stores files via',
+    's3': 'file storage',
+    'cloudinary': 'media storage',
+    'minio': 'file storage',
+    'flysystem': 'file storage',
     # Monitoring / Logging
-    'sentry': 'reports errors to',
-    'datadog': 'sends metrics to',
-    'prometheus': 'exposes metrics for',
-    'grafana': 'visualizes in',
-    'bugsnag': 'reports errors to',
+    'sentry': 'error reporting',
+    'datadog': 'metrics',
+    'prometheus': 'metrics',
+    'grafana': 'dashboards',
+    'bugsnag': 'error reporting',
     # Mail
-    'mailgun': 'sends email via',
-    'sendgrid': 'sends email via',
-    'smtp': 'sends email via',
-    'mailer': 'sends email via',
+    'mailgun': 'sends email',
+    'sendgrid': 'sends email',
+    'smtp': 'sends email',
+    'mailer': 'sends email',
     # Payment
-    'stripe': 'processes payments via',
-    'paypal': 'processes payments via',
-    'braintree': 'processes payments via',
+    'stripe': 'payments',
+    'paypal': 'payments',
+    'braintree': 'payments',
+    # Real-time
+    'pusher': 'WebSocket events',
+    'aws_s3': 'file storage',
+    'aws s3': 'file storage',
 }
 
 
@@ -2129,66 +2134,87 @@ def make_sequence_from_findings(findings: dict, project_name: str) -> list:
 
 
 def generate_c4_context(findings: dict, project_name: str, c4_alias_fn=None) -> str:
-    """L1: C4 System Context — system as black box with user personas and real external systems."""
+    """L1: C4 System Context — system as black box with user personas and real external systems.
+
+    Node limit: max 10 total (2 personas + system + up to 7 external).
+    External: only database/queue/cache types, top 5 preferred systems.
+    Rel() labels: max 25 characters.
+    """
     _alias = c4_alias_fn if c4_alias_fn is not None else c4_alias
 
     lines = ["```mermaid", "C4Context", f'  title System Context — {project_name}', ""]
 
-    # Real user personas with meaningful descriptions
-    lines.append(f'  Person(player, "Игрок / Player", "End user: registration, deposits, gaming")')
-    lines.append(f'  Person(admin, "Администратор / Admin", "Manages platform via Nova admin panel")')
+    # 2 user personas
+    lines.append(f'  Person(player, "Player", "Registers, deposits, plays")')
+    lines.append(f'  Person(admin, "Admin", "Manages via admin panel")')
     lines.append("")
 
     # System as a black box
-    description = c4_label(findings.get("description", f"Main platform system: {project_name}"))
+    description = c4_label(findings.get("description", f"Platform: {project_name}"))[:60]
     lines.append(f'  System(main_system, "{project_name}", "{description}")')
     lines.append("")
 
-    # Collect ALL unique external deps across all layers (deduplicated by normalized key)
+    # Collect external deps — ONLY database, queue, cache types
+    _ALLOWED_TYPES = {"database", "db", "cache", "queue", "message_queue", "broker", "messaging"}
+    # Preferred order for top-5 selection
+    _PRIORITY_KEYS = ["mysql", "postgres", "postgresql", "redis", "rabbitmq", "clickhouse", "elasticsearch", "mongo", "mongodb"]
+
     ext_seen: set = set()
-    ext_list = []  # (alias, display, dep_type, label)
-    aliases_used: dict = {}  # key -> alias (stable, no re-aliasing)
+    ext_candidates = []  # (key, alias, display, dep_type)
 
     for layer in findings.get("layers", []):
         for dep in layer.get("external_deps", []):
             name = dep.get("name", "")
             if not name or not is_real_external_system(name):
                 continue
+            dep_type = dep.get("type", "other")
+            if dep_type not in _ALLOWED_TYPES:
+                continue  # skip http, auth, mail, other, monitoring, payment
             key = _normalize_system_name(name)
             if key not in ext_seen:
                 ext_seen.add(key)
-                dep_type = dep.get("type", "other")
-                label = dep.get("label") or get_rel_label(key)
                 display = _CANONICAL_DISPLAY.get(key, name)
                 raw_alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
                 raw_alias = re.sub(r'_+', '_', raw_alias) or 'ext_sys'
-                aliases_used[key] = raw_alias
-                ext_list.append((raw_alias, display, dep_type, label))
+                ext_candidates.append((key, raw_alias, display, dep_type))
 
-    # Emit external system nodes with semantically correct C4 types
-    for alias, display, dep_type, label in ext_list:
+    # Pick top 5: preferred systems first, then others
+    def _ext_priority(item):
+        key = item[0]
+        try:
+            return _PRIORITY_KEYS.index(key)
+        except ValueError:
+            return len(_PRIORITY_KEYS)
+
+    ext_candidates.sort(key=_ext_priority)
+    ext_list = ext_candidates[:5]  # max 5 external nodes
+
+    # Short Rel labels by type (max 20 chars)
+    _TYPE_LABEL = {
+        "database": "reads/writes",
+        "db": "reads/writes",
+        "cache": "cache/sessions",
+        "queue": "async jobs",
+        "message_queue": "async jobs",
+        "broker": "async jobs",
+        "messaging": "async jobs",
+    }
+
+    # Emit external system nodes
+    for key, alias, display, dep_type in ext_list:
         if dep_type in ("database", "db"):
             lines.append(f'  SystemDb_Ext({alias}, "{display}", "Database")')
         elif dep_type == "cache":
             lines.append(f'  SystemDb_Ext({alias}, "{display}", "Cache")')
         elif dep_type in ("queue", "message_queue", "broker", "messaging"):
             lines.append(f'  SystemQueue_Ext({alias}, "{display}", "Message broker")')
-        elif dep_type == "mail":
-            lines.append(f'  System_Ext({alias}, "{display}", "Email provider")')
-        elif dep_type == "monitoring":
-            lines.append(f'  System_Ext({alias}, "{display}", "Monitoring")')
-        elif dep_type == "payment":
-            lines.append(f'  System_Ext({alias}, "{display}", "Payment gateway")')
-        else:
-            lines.append(f'  System_Ext({alias}, "{display}", "External system")')
 
     lines.append("")
     lines.append("  %% Relations")
-    # User → system relationships with labeled protocols
-    lines.append(f'  Rel(player, main_system, "registers, deposits, plays", "HTTPS")')
-    lines.append(f'  Rel(admin, main_system, "manages data and settings", "HTTPS/Nova")')
-    # System → each external dependency
-    for alias, display, dep_type, label in ext_list:
+    lines.append(f'  Rel(player, main_system, "plays & deposits", "HTTPS")')
+    lines.append(f'  Rel(admin, main_system, "manages platform", "HTTPS")')
+    for key, alias, display, dep_type in ext_list:
+        label = _TYPE_LABEL.get(dep_type, "uses")[:25]
         lines.append(f'  Rel(main_system, {alias}, "{label}")')
 
     lines.append("```")
@@ -2221,7 +2247,7 @@ def generate_c4_container(findings: dict, project_name: str, c4_alias_fn=None) -
             if key not in ext_seen:
                 ext_seen.add(key)
                 dep_type = dep.get("type", "other")
-                label = dep.get("label") or get_rel_label(key)
+                label = get_rel_label(key)  # always use short canonical label
                 display = _CANONICAL_DISPLAY.get(key, name)
                 raw_alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
                 raw_alias = re.sub(r'_+', '_', raw_alias) or 'ext_sys'
@@ -2350,26 +2376,26 @@ def generate_c4_container(findings: dict, project_name: str, c4_alias_fn=None) -
 
     # Player and Admin → nginx (entry point)
     if nginx_alias:
-        _add_rel("player", nginx_alias, "HTTP requests", "HTTPS")
-        _add_rel("admin", nginx_alias, "admin requests", "HTTPS")
+        _add_rel("player", nginx_alias, "HTTPS")
+        _add_rel("admin", nginx_alias, "HTTPS")
     elif octane_alias:
-        _add_rel("player", octane_alias, "API requests", "HTTPS")
+        _add_rel("player", octane_alias, "HTTPS")
     if nova_alias and not nginx_alias:
-        _add_rel("admin", nova_alias, "manages via admin panel", "HTTPS")
+        _add_rel("admin", nova_alias, "HTTPS")
 
     # nginx → backend containers
     if nginx_alias and octane_alias:
-        _add_rel(nginx_alias, octane_alias, "proxy API requests", "HTTP")
+        _add_rel(nginx_alias, octane_alias, "proxy", "HTTP")
     if nginx_alias and nova_alias:
-        _add_rel(nginx_alias, nova_alias, "proxy admin requests", "HTTP")
+        _add_rel(nginx_alias, nova_alias, "proxy admin", "HTTP")
 
     # octane → modules (if present)
     if octane_alias and modules_alias:
-        _add_rel(octane_alias, modules_alias, "calls business modules")
+        _add_rel(octane_alias, modules_alias, "event dispatch")
 
     # octane → queue workers
     if octane_alias and workers_alias:
-        _add_rel(octane_alias, workers_alias, "dispatches jobs", "RabbitMQ/AMQP")
+        _add_rel(octane_alias, workers_alias, "dispatch jobs", "AMQP")
 
     # octane → external databases and caches
     if octane_alias:
@@ -2379,7 +2405,7 @@ def generate_c4_container(findings: dict, project_name: str, c4_alias_fn=None) -
     # octane → queues
     if octane_alias:
         for q_alias in ext_queue_aliases:
-            _add_rel(octane_alias, q_alias, "publishes messages", "AMQP")
+            _add_rel(octane_alias, q_alias, "async jobs", "AMQP")
 
     # queue workers → databases (read/write for job processing)
     if workers_alias:
@@ -2390,7 +2416,11 @@ def generate_c4_container(findings: dict, project_name: str, c4_alias_fn=None) -
     for rel in cross_rels:
         src_name = rel.get('from', '')
         dst_name = rel.get('to', '')
-        label = c4_label(rel.get('label', rel.get('description', 'calls')))
+        raw_label = rel.get('label', rel.get('description', 'calls'))
+        # Keep labels short — strip protocol details like [JSON/HTTPS]
+        label = re.sub(r'\[.*?\]', '', raw_label).strip()
+        label = re.split(r'\s*[+&]\s*', label)[0].strip()  # take first part if joined
+        label = label[:25]
         src_a = container_aliases.get(src_name) or container_aliases.get(src_name.lower())
         dst_a = container_aliases.get(dst_name) or container_aliases.get(dst_name.lower())
         if src_a and dst_a:
@@ -2452,8 +2482,8 @@ def generate_c4_component(findings: dict, project_name: str, c4_alias_fn=None) -
         if not name or not is_real_external_system(name):
             continue
         dep_type = dep.get("type", "other")
-        label = dep.get("label") or get_rel_label(_normalize_system_name(name))
         key = _normalize_system_name(name)
+        label = get_rel_label(key)  # always use short canonical label
         display = _CANONICAL_DISPLAY.get(key, name)
         raw_alias = re.sub(r'[^a-zA-Z0-9]', '_', key).strip('_')
         raw_alias = re.sub(r'_+', '_', raw_alias) or 'ext_sys'
