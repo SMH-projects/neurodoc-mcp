@@ -3446,6 +3446,376 @@ def ndoc_explore(project_path: str = "") -> str:
     return '\n'.join(out)
 
 
+def generate_c4_overview_svg(findings: dict, project_name: str) -> str:
+    """Generate a C4 model overview SVG showing all 4 levels on a single wide canvas."""
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def esc(s: str) -> str:
+        return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+    def rect(x, y, w, h, fill, stroke, rx=8, opacity=1.0, stroke_width=2):
+        return (f'<rect x="{x}" y="{y}" width="{w}" height="{h}" '
+                f'rx="{rx}" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}" '
+                f'opacity="{opacity}"/>')
+
+    def text(x, y, s, size=13, anchor='middle', weight='normal', fill='#222', dy=0):
+        dy_attr = f' dy="{dy}"' if dy else ''
+        return (f'<text x="{x}" y="{y}"{dy_attr} text-anchor="{anchor}" '
+                f'font-size="{size}" font-weight="{weight}" fill="{fill}" '
+                f'font-family="Arial,Helvetica,sans-serif">{esc(s)}</text>')
+
+    def line(x1, y1, x2, y2, stroke, sw=2, dash=''):
+        d = f' stroke-dasharray="{dash}"' if dash else ''
+        return f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{stroke}" stroke-width="{sw}"{d}/>'
+
+    def arrow_marker(mid, color):
+        return (f'<marker id="arr_{mid}" markerWidth="10" markerHeight="7" '
+                f'refX="9" refY="3.5" orient="auto">'
+                f'<polygon points="0 0, 10 3.5, 0 7" fill="{color}"/>'
+                f'</marker>')
+
+    def arrow(x1, y1, x2, y2, color, mid, sw=2, dash=''):
+        d = f' stroke-dasharray="{dash}"' if dash else ''
+        return (f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" '
+                f'stroke="{color}" stroke-width="{sw}"{d} '
+                f'marker-end="url(#arr_{mid})"/>')
+
+    def person_icon(cx, cy, color='#1168bd', size=28):
+        r = size // 3
+        head_y = cy - size // 2
+        body_y = head_y + r * 2
+        return (f'<circle cx="{cx}" cy="{head_y}" r="{r}" fill="{color}"/>'
+                f'<line x1="{cx}" y1="{body_y}" x2="{cx}" y2="{body_y + size // 3}" '
+                f'stroke="{color}" stroke-width="3"/>'
+                f'<line x1="{cx - r}" y1="{body_y + 4}" x2="{cx + r}" y2="{body_y + 4}" '
+                f'stroke="{color}" stroke-width="3"/>'
+                f'<line x1="{cx}" y1="{body_y + size // 3}" x2="{cx - r}" y2="{cy + size // 2}" '
+                f'stroke="{color}" stroke-width="3"/>'
+                f'<line x1="{cx}" y1="{body_y + size // 3}" x2="{cx + r}" y2="{cy + size // 2}" '
+                f'stroke="{color}" stroke-width="3"/>')
+
+    def wrap_lines(s: str, max_len: int = 22) -> list:
+        words = s.split()
+        lines_out, cur = [], ''
+        for w in words:
+            if not cur:
+                cur = w
+            elif len(cur) + 1 + len(w) <= max_len:
+                cur += ' ' + w
+            else:
+                lines_out.append(cur)
+                cur = w
+        if cur:
+            lines_out.append(cur)
+        return lines_out or ['']
+
+    def multiline_text(x, cy, s, size=11, anchor='middle', fill='#222', max_len=22):
+        parts = wrap_lines(s, max_len)
+        total = len(parts)
+        line_h = size + 3
+        start_y = cy - (total - 1) * line_h / 2
+        out = []
+        for i, part in enumerate(parts):
+            out.append(text(x, start_y + i * line_h, part, size=size, anchor=anchor, fill=fill))
+        return ''.join(out)
+
+    # ── extract data from findings ────────────────────────────────────────────
+    layers = findings.get('layers', [])
+    modules = findings.get('modules', [])
+
+    # L1: person, system, external deps
+    external_systems_all: list = []
+    for layer in layers:
+        for dep in layer.get('external_deps', []):
+            name = dep if isinstance(dep, str) else dep.get('name', str(dep))
+            if name and name not in external_systems_all:
+                external_systems_all.append(name)
+    ext_l1 = external_systems_all[:3]
+
+    # L2: containers from infra/backend layers
+    containers: list = []
+    for layer in layers:
+        lname = layer.get('name', '')
+        kc = layer.get('key_components', [])
+        for item in kc[:4]:
+            cname = item if isinstance(item, str) else item.get('name', str(item))
+            if cname:
+                containers.append({'name': cname, 'layer': lname})
+    if not containers:
+        containers = [{'name': 'API Server', 'layer': 'Backend'},
+                      {'name': 'Database', 'layer': 'Infra'},
+                      {'name': 'Cache', 'layer': 'Infra'}]
+    containers = containers[:5]
+
+    # L3: components from first non-infra layer with relationships
+    comp_layer = None
+    for layer in layers:
+        if layer.get('key_components') and layer.get('component_relationships'):
+            comp_layer = layer
+            break
+    if comp_layer is None:
+        for layer in layers:
+            if layer.get('key_components'):
+                comp_layer = layer
+                break
+    comp_components: list = []
+    comp_rels: list = []
+    if comp_layer:
+        for item in comp_layer.get('key_components', [])[:5]:
+            cname = item if isinstance(item, str) else item.get('name', str(item))
+            if cname:
+                comp_components.append(cname)
+        comp_rels = comp_layer.get('component_relationships', [])[:4]
+
+    # L4: class names from key_flows steps
+    l4_classes: list = []
+    for layer in layers:
+        for flow in layer.get('key_flows', [])[:1]:
+            for step in flow.get('steps', [])[:4]:
+                s = step if isinstance(step, str) else step.get('component', str(step))
+                if s and s not in l4_classes:
+                    l4_classes.append(s)
+    if not l4_classes:
+        for flow in findings.get('key_flows', [])[:1]:
+            for step in flow.get('steps', [])[:4]:
+                s = step if isinstance(step, str) else step.get('component', str(step))
+                if s and s not in l4_classes:
+                    l4_classes.append(s)
+    if not l4_classes:
+        l4_classes = ['Controller', 'Service', 'Repository', 'Model']
+    l4_classes = l4_classes[:4]
+
+    # ── canvas & panel layout ─────────────────────────────────────────────────
+    W, H = 3300, 1380
+
+    # Panel positions (x, y, w, h)
+    P1 = (40,   60,  680, 560)   # L1 Context
+    P2 = (780,  200, 780, 720)   # L2 Containers
+    P3 = (1640, 340, 820, 760)   # L3 Components
+    P4 = (2540, 480, 720, 700)   # L4 Code
+
+    # Panel tints
+    TINT1 = '#dbeafe'   # blue
+    TINT2 = '#dcfce7'   # green
+    TINT3 = '#fff3cd'   # orange/yellow
+    TINT4 = '#fde8e8'   # red
+    BORDER1 = '#3b82f6'
+    BORDER2 = '#22c55e'
+    BORDER3 = '#f59e0b'
+    BORDER4 = '#ef4444'
+
+    # Zoom arrow colors
+    Z_COLOR1 = '#22c55e'  # green  L1→L2
+    Z_COLOR2 = '#f59e0b'  # orange L2→L3
+    Z_COLOR3 = '#ef4444'  # red    L3→L4
+
+    svg_parts = []
+
+    # ── defs: arrow markers ───────────────────────────────────────────────────
+    svg_parts.append('<defs>')
+    svg_parts.append(arrow_marker('green', Z_COLOR1))
+    svg_parts.append(arrow_marker('orange', Z_COLOR2))
+    svg_parts.append(arrow_marker('red', Z_COLOR3))
+    svg_parts.append(arrow_marker('blue', '#1168bd'))
+    svg_parts.append(arrow_marker('gray', '#888'))
+    svg_parts.append('</defs>')
+
+    # ── background ───────────────────────────────────────────────────────────
+    svg_parts.append(rect(0, 0, W, H, '#f8f9fa', 'none', rx=0))
+
+    # ── title ────────────────────────────────────────────────────────────────
+    svg_parts.append(text(W // 2, 42, f'C4 Architecture Overview — {esc(project_name)}',
+                          size=28, weight='bold', fill='#1a1a2e'))
+
+    # ══ PANEL 1: L1 Context ══════════════════════════════════════════════════
+    x1, y1, w1, h1 = P1
+    svg_parts.append(rect(x1, y1, w1, h1, TINT1, BORDER1, rx=12, stroke_width=3))
+    svg_parts.append(text(x1 + w1 // 2, y1 + 32, 'L1 — Context', size=18, weight='bold', fill=BORDER1))
+
+    # Person
+    pcx, pcy = x1 + 120, y1 + 160
+    svg_parts.append(person_icon(pcx, pcy, color='#1168bd', size=40))
+    svg_parts.append(text(pcx, pcy + 40, 'User', size=12, fill='#1168bd', weight='bold'))
+
+    # System box
+    sx, sy, sw, sh = x1 + 230, y1 + 120, 200, 80
+    svg_parts.append(rect(sx, sy, sw, sh, '#1168bd', '#0d4f8c', rx=6))
+    svg_parts.append(text(sx + sw // 2, sy + 30, project_name[:18], size=13, weight='bold', fill='white'))
+    svg_parts.append(text(sx + sw // 2, sy + 50, '[Software System]', size=10, fill='#cce0ff'))
+
+    # Arrow: person → system
+    svg_parts.append(arrow(pcx + 25, pcy, sx, sy + sh // 2, '#1168bd', 'blue'))
+
+    # External systems
+    ext_colors = ['#999', '#777', '#aaa']
+    for idx, ext in enumerate(ext_l1):
+        ex = x1 + 60 + idx * 200
+        ey = y1 + 360
+        ew, eh = 140, 60
+        svg_parts.append(rect(ex, ey, ew, eh, '#e5e7eb', '#6b7280', rx=6))
+        svg_parts.append(multiline_text(ex + ew // 2, ey + eh // 2, ext[:20], size=10, fill='#333'))
+        # Arrow from system to external
+        svg_parts.append(arrow(sx + sw // 2, sy + sh, ex + ew // 2, ey, '#888', 'gray', dash='6,4'))
+
+    if not ext_l1:
+        ex, ey, ew, eh = x1 + 80, y1 + 360, 140, 60
+        svg_parts.append(rect(ex, ey, ew, eh, '#e5e7eb', '#6b7280', rx=6))
+        svg_parts.append(text(ex + ew // 2, ey + eh // 2, 'External System', size=10, fill='#555'))
+
+    # ══ PANEL 2: L2 Containers ═══════════════════════════════════════════════
+    x2, y2, w2, h2 = P2
+    svg_parts.append(rect(x2, y2, w2, h2, TINT2, BORDER2, rx=12, stroke_width=3))
+    svg_parts.append(text(x2 + w2 // 2, y2 + 32, 'L2 — Containers', size=18, weight='bold', fill='#166534'))
+
+    # System boundary inner box
+    bx, by, bw, bh = x2 + 30, y2 + 55, w2 - 60, h2 - 120
+    svg_parts.append(rect(bx, by, bw, bh, 'none', BORDER2, rx=8, stroke_width=2))
+    svg_parts.append(text(bx + 8, by + 16, f'[{project_name[:20]}]', size=10, fill=BORDER2, anchor='start'))
+
+    # Container boxes
+    cols, rows = 2, 3
+    cw, ch = 140, 60
+    cx_start = bx + (bw - cols * cw - (cols - 1) * 20) // 2
+    cy_start = by + 35
+    for idx, cont in enumerate(containers[:cols * rows]):
+        col = idx % cols
+        row = idx // cols
+        cx_ = cx_start + col * (cw + 20)
+        cy_ = cy_start + row * (ch + 18)
+        cname = cont['name'] if isinstance(cont, dict) else str(cont)
+        clayer = cont.get('layer', '') if isinstance(cont, dict) else ''
+        c_fill = '#166534' if 'infra' in clayer.lower() or 'db' in cname.lower() else '#15803d'
+        svg_parts.append(rect(cx_, cy_, cw, ch, c_fill, '#14532d', rx=5))
+        svg_parts.append(multiline_text(cx_ + cw // 2, cy_ + ch // 2, cname[:22], size=10, fill='white'))
+
+    # External DBs below boundary
+    db_x, db_y = x2 + 50, y2 + h2 - 55
+    svg_parts.append(rect(db_x, db_y, 130, 40, '#d1fae5', '#059669', rx=4))
+    svg_parts.append(text(db_x + 65, db_y + 24, 'Database', size=10, fill='#065f46'))
+
+    # ══ PANEL 3: L3 Components ═══════════════════════════════════════════════
+    x3, y3, w3, h3 = P3
+    svg_parts.append(rect(x3, y3, w3, h3, TINT3, BORDER3, rx=12, stroke_width=3))
+    svg_parts.append(text(x3 + w3 // 2, y3 + 32, 'L3 — Components', size=18, weight='bold', fill='#92400e'))
+
+    # Container boundary
+    cbx, cby, cbw, cbh = x3 + 30, y3 + 55, w3 - 60, h3 - 120
+    svg_parts.append(rect(cbx, cby, cbw, cbh, 'none', BORDER3, rx=8, stroke_width=2))
+    layer_label = comp_layer.get('name', 'Container') if comp_layer else 'Container'
+    svg_parts.append(text(cbx + 8, cby + 16, f'[{layer_label[:24]}]', size=10, fill=BORDER3, anchor='start'))
+
+    comp_boxes = {}
+    cw3, ch3 = 150, 52
+    n_comp = len(comp_components) or 1
+    comp_per_col = min(3, n_comp)
+    comp_cols = (n_comp + comp_per_col - 1) // comp_per_col
+    cx3_start = cbx + (cbw - comp_cols * cw3 - (comp_cols - 1) * 20) // 2
+    for idx, comp in enumerate(comp_components):
+        col = idx % comp_cols if comp_cols > 1 else 0
+        row = idx // comp_cols if comp_cols > 1 else idx
+        cx_ = cx3_start + col * (cw3 + 20)
+        cy_ = cby + 35 + row * (ch3 + 14)
+        svg_parts.append(rect(cx_, cy_, cw3, ch3, '#d97706', '#b45309', rx=5))
+        svg_parts.append(multiline_text(cx_ + cw3 // 2, cy_ + ch3 // 2, comp[:24], size=10, fill='white'))
+        comp_boxes[comp] = (cx_ + cw3 // 2, cy_ + ch3 // 2, cx_, cy_, cw3, ch3)
+
+    # Relationship arrows
+    for rel in comp_rels[:3]:
+        frm = rel.get('from', '') if isinstance(rel, dict) else ''
+        to_ = rel.get('to', '') if isinstance(rel, dict) else ''
+        if frm in comp_boxes and to_ in comp_boxes:
+            fx, fy = comp_boxes[frm][0], comp_boxes[frm][1] + comp_boxes[frm][5] // 2
+            tx, ty = comp_boxes[to_][0], comp_boxes[to_][1] - comp_boxes[to_][5] // 2
+            svg_parts.append(arrow(fx, fy, tx, ty, '#b45309', 'gray', sw=1, dash='4,3'))
+
+    # ══ PANEL 4: L4 Code ═════════════════════════════════════════════════════
+    x4, y4, w4, h4 = P4
+    svg_parts.append(rect(x4, y4, w4, h4, TINT4, BORDER4, rx=12, stroke_width=3))
+    svg_parts.append(text(x4 + w4 // 2, y4 + 32, 'L4 — Code', size=18, weight='bold', fill='#991b1b'))
+
+    # Class boxes
+    cw4, ch4 = 180, 90
+    n4 = len(l4_classes)
+    col_gap = 20
+    grid_w = min(2, n4) * (cw4 + col_gap) - col_gap
+    cx4_start = x4 + (w4 - grid_w) // 2
+    for idx, cls in enumerate(l4_classes):
+        col = idx % 2
+        row = idx // 2
+        cx_ = cx4_start + col * (cw4 + col_gap)
+        cy_ = y4 + 60 + row * (ch4 + 18)
+        svg_parts.append(rect(cx_, cy_, cw4, ch4, '#fee2e2', BORDER4, rx=5))
+        # Class header
+        svg_parts.append(rect(cx_, cy_, cw4, 26, BORDER4, BORDER4, rx=5))
+        svg_parts.append(text(cx_ + cw4 // 2, cy_ + 17, cls[:22], size=11, weight='bold', fill='white'))
+        # Methods placeholder
+        svg_parts.append(text(cx_ + 8, cy_ + 42, '+ method()', size=9, anchor='start', fill='#555'))
+        svg_parts.append(text(cx_ + 8, cy_ + 57, '+ property', size=9, anchor='start', fill='#555'))
+
+    # Arrows between class boxes (chain)
+    for i in range(min(n4 - 1, 3)):
+        col_a, row_a = i % 2, i // 2
+        col_b, row_b = (i + 1) % 2, (i + 1) // 2
+        ax_ = cx4_start + col_a * (cw4 + col_gap) + cw4 // 2
+        ay_ = y4 + 60 + row_a * (ch4 + 18) + ch4
+        bx_ = cx4_start + col_b * (cw4 + col_gap) + cw4 // 2
+        by__ = y4 + 60 + row_b * (ch4 + 18)
+        svg_parts.append(arrow(ax_, ay_, bx_, by__, '#ef4444', 'red', sw=1))
+
+    # ══ Zoom-in diagonal arrows between panels ════════════════════════════════
+    # L1 → L2
+    ax_l1 = P1[0] + P1[2]
+    ay_l1 = P1[1] + P1[3] // 2
+    bx_l2 = P2[0]
+    by_l2 = P2[1] + P2[3] // 2
+    mid_x12 = (ax_l1 + bx_l2) // 2
+    mid_y12 = (ay_l1 + by_l2) // 2
+    svg_parts.append(f'<path d="M {ax_l1} {ay_l1} Q {mid_x12} {mid_y12 - 60} {bx_l2} {by_l2}" '
+                     f'fill="none" stroke="{Z_COLOR1}" stroke-width="3" '
+                     f'marker-end="url(#arr_green)"/>')
+    svg_parts.append(text(mid_x12, mid_y12 - 70, 'Zoom in', size=13, fill=Z_COLOR1, weight='bold'))
+
+    # L2 → L3
+    ax_l2 = P2[0] + P2[2]
+    ay_l2 = P2[1] + P2[3] // 2
+    bx_l3 = P3[0]
+    by_l3 = P3[1] + P3[3] // 2
+    mid_x23 = (ax_l2 + bx_l3) // 2
+    mid_y23 = (ay_l2 + by_l3) // 2
+    svg_parts.append(f'<path d="M {ax_l2} {ay_l2} Q {mid_x23} {mid_y23 - 60} {bx_l3} {by_l3}" '
+                     f'fill="none" stroke="{Z_COLOR2}" stroke-width="3" '
+                     f'marker-end="url(#arr_orange)"/>')
+    svg_parts.append(text(mid_x23, mid_y23 - 70, 'Zoom in', size=13, fill=Z_COLOR2, weight='bold'))
+
+    # L3 → L4
+    ax_l3 = P3[0] + P3[2]
+    ay_l3 = P3[1] + P3[3] // 2
+    bx_l4 = P4[0]
+    by_l4 = P4[1] + P4[3] // 2
+    mid_x34 = (ax_l3 + bx_l4) // 2
+    mid_y34 = (ay_l3 + by_l4) // 2
+    svg_parts.append(f'<path d="M {ax_l3} {ay_l3} Q {mid_x34} {mid_y34 - 60} {bx_l4} {by_l4}" '
+                     f'fill="none" stroke="{Z_COLOR3}" stroke-width="3" '
+                     f'marker-end="url(#arr_red)"/>')
+    svg_parts.append(text(mid_x34, mid_y34 - 70, 'Zoom in', size=13, fill=Z_COLOR3, weight='bold'))
+
+    # ══ Level labels at bottom ════════════════════════════════════════════════
+    label_y = H - 30
+    labels = [
+        (P1[0] + P1[2] // 2, 'Level 1 / Context', BORDER1),
+        (P2[0] + P2[2] // 2, 'Level 2 / Containers', BORDER2),
+        (P3[0] + P3[2] // 2, 'Level 3 / Components', BORDER3),
+        (P4[0] + P4[2] // 2, 'Level 4 / Code', BORDER4),
+    ]
+    for lx, lbl, lcolor in labels:
+        svg_parts.append(text(lx, label_y, lbl, size=15, fill=lcolor, weight='bold'))
+
+    # ══ Assemble SVG ══════════════════════════════════════════════════════════
+    header = (f'<svg xmlns="http://www.w3.org/2000/svg" '
+              f'width="{W}" height="{H}" viewBox="0 0 {W} {H}">')
+    return header + '\n'.join(svg_parts) + '</svg>'
+
+
 def ndoc_generate(project_path: str = "", findings: str = "") -> str:
     """
     Generate enriched context.md files and context.index.md with full C4 architecture diagrams (Context, Container, Component levels) from agent research findings.
@@ -3761,8 +4131,19 @@ def ndoc_generate(project_path: str = "", findings: str = "") -> str:
         index_lines += make_sequence_from_findings(data_with_flows, project_name)
         index_lines.append("")
 
+    # Append C4 Overview SVG link to context.index.md
+    index_lines += ["", "## C4 Overview", "![C4 Architecture Overview](c4-overview.svg)", ""]
     (root / 'context.index.md').write_text('\n'.join(index_lines), encoding='utf-8')
     out.append("   ok: context.index.md written with C4 Context + Container + Component + Dynamic (4 levels)")
+
+    # Generate C4 overview SVG
+    try:
+        svg_content = generate_c4_overview_svg(data, project_name)
+        svg_path = root / 'c4-overview.svg'
+        svg_path.write_text(svg_content, encoding='utf-8')
+        out.append("   ok: c4-overview.svg generated (4-level C4 overview)")
+    except Exception as _svg_err:
+        out.append(f"   warn: c4-overview.svg generation failed: {_svg_err}")
 
     # ── Step 4: Update CLAUDE.md ──
     out.append("\nStep 4/4 — Updating CLAUDE.md...")
