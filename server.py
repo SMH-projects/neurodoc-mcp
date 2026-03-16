@@ -635,7 +635,10 @@ def scan_dir(dir_path: Path) -> dict:
 def short_name(dir_path: Path, root: Path) -> str:
     if dir_path == root:
         return root.name
-    return dir_path.name
+    try:
+        return str(dir_path.relative_to(root))
+    except ValueError:
+        return dir_path.name
 
 
 def resolve_deps(imports: list, all_modules: list) -> list:
