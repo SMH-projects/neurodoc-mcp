@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 NeuroDoc MCP Server
-Commands: ndoc_init · ndoc_update · ndoc_validate · ndoc_status
+Commands: ndoc_init · ndoc_update · ndoc_validate · ndoc_status · ndoc_c4
 
 Usage:
   python server.py                        # stdio (default, for local Claude Code)
