@@ -1116,6 +1116,12 @@ _FRAMEWORK_SIGNATURES = [
     ('package.json',      r'"nuxt"[^a-z]',                  'Nuxt',        'TypeScript'),
     ('package.json',      r'"@remix-run',                   'Remix',       'TypeScript'),
     ('package.json',      r'"svelte"[^a-z]',                'SvelteKit',   'TypeScript'),
+    ('package.json',      r'"@angular/core"',               'Angular',     'TypeScript'),
+    ('package.json',      r'"react"[^a-z]',                 'React',       'TypeScript'),
+    ('package.json',      r'"vue"[^a-z]',                   'Vue',         'TypeScript'),
+    ('package.json',      r'"solid-js"',                    'SolidJS',     'TypeScript'),
+    ('package.json',      r'"astro"[^a-z]',                 'Astro',       'TypeScript'),
+    ('package.json',      r'"qwik"[^a-z]',                  'Qwik',        'TypeScript'),
     ('package.json',      r'"express"[^a-z]',               'Express',     'Node.js'),
     ('package.json',      r'"fastify"[^a-z]',               'Fastify',     'Node.js'),
     ('package.json',      r'"hono"[^a-z]',                  'Hono',        'Node.js'),
@@ -1124,6 +1130,10 @@ _FRAMEWORK_SIGNATURES = [
     ('go.mod',            r'labstack/echo',                  'Echo',        'Go'),
     ('go.mod',            r'gofiber/fiber',                  'Fiber',       'Go'),
     ('go.mod',            r'go-chi/chi',                     'Chi',         'Go'),
+    ('go.mod',            r'gorilla/mux',                    'Gorilla Mux', 'Go'),
+    ('go.mod',            r'julienschmidt/httprouter',       'HttpRouter',  'Go'),
+    ('go.mod',            r'go-kratos/kratos',               'Kratos',      'Go'),
+    ('go.mod',            r'google.golang.org/grpc',         'gRPC Service','Go'),
     ('pom.xml',           r'spring-boot',                   'Spring Boot', 'Java'),
     ('build.gradle',      r'spring-boot',                   'Spring Boot', 'Java/Kotlin'),
     ('build.gradle.kts',  r'spring-boot',                   'Spring Boot', 'Kotlin'),
@@ -1436,8 +1446,13 @@ def _detect_modules(root, framework):
         'Rust': '.rs', 'C#': '.cs', 'Elixir': '.ex',
     }
     ext = ext_map.get(lang, '.php')
+    # Frontend: count .ts/.tsx/.js/.jsx/.vue/.svelte together
+    _frontend_fws = {'React', 'Vue', 'Angular', 'SolidJS', 'Astro', 'Qwik', 'SvelteKit'}
+    _frontend_exts = {'.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte'}
 
     def count_files(d):
+        if fw in _frontend_fws:
+            return sum(1 for f in d.rglob('*') if f.is_file() and f.suffix in _frontend_exts)
         return sum(1 for _ in d.rglob(f'*{ext}') if _.is_file())
 
     # Laravel — nwidart modules
@@ -1477,7 +1492,7 @@ def _detect_modules(root, framework):
                                         'files': count_files(item), 'type': 'controller_group'})
                 if modules:
                     break
-    # NestJS / Express / Node
+    # NestJS / Express / Node (backend)
     if fw in ('NestJS', 'Express', 'Fastify', 'Hono', 'Koa', 'Next.js', 'Nuxt', 'Remix'):
         for src in ('src', 'app', 'lib', 'modules'):
             d = root / src
@@ -1490,9 +1505,48 @@ def _detect_modules(root, framework):
                                             'files': n, 'type': 'module'})
                 if modules:
                     break
-    # Go — internal/pkg/cmd
+    # React / Vue / Angular / SolidJS / Astro / Qwik — frontend
+    if fw in ('React', 'Vue', 'Angular', 'SolidJS', 'Astro', 'Qwik', 'SvelteKit'):
+        # Feature-based layout first: src/features/ or src/modules/
+        found_feature = False
+        for feat_dir in ('src/features', 'src/modules', 'src/pages', 'app/(.*)', 'pages'):
+            d = root / feat_dir.split('(')[0]
+            if d.exists():
+                for item in sorted(d.iterdir()):
+                    if item.is_dir() and item.name not in SKIP_DIRS:
+                        n = sum(1 for _ in item.rglob('*') if _.suffix in ('.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte'))
+                        if n > 0:
+                            modules.append({'name': item.name, 'path': str(item.relative_to(root)),
+                                            'files': n, 'type': 'feature'})
+                if modules:
+                    found_feature = True
+                    break
+        # If no feature dirs, scan src/ top-level dirs as UI layers
+        if not found_feature:
+            _ui_dirs = ('components', 'pages', 'views', 'layouts', 'store', 'stores',
+                        'hooks', 'composables', 'services', 'utils', 'api', 'lib',
+                        'context', 'providers', 'atoms', 'molecules', 'organisms')
+            src_d = root / 'src'
+            if src_d.exists():
+                for item in sorted(src_d.iterdir()):
+                    if item.is_dir() and item.name in _ui_dirs:
+                        n = sum(1 for _ in item.rglob('*') if _.suffix in ('.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte'))
+                        if n > 0:
+                            modules.append({'name': item.name, 'path': str(item.relative_to(root)),
+                                            'files': n, 'type': 'ui-layer'})
+            # Also check root-level pages/ or app/ (Next.js app router, Astro)
+            for top in ('pages', 'app', 'src/app'):
+                d = root / top
+                if d.exists() and not modules:
+                    for item in sorted(d.iterdir()):
+                        if item.is_dir() and item.name not in SKIP_DIRS | {'api'}:
+                            n = sum(1 for _ in item.rglob('*') if _.suffix in ('.ts', '.tsx', '.js', '.jsx'))
+                            if n > 0:
+                                modules.append({'name': item.name, 'path': str(item.relative_to(root)),
+                                                'files': n, 'type': 'page-group'})
+    # Go — internal/pkg/cmd (all Go frameworks + plain Go)
     if lang == 'Go':
-        for src in ('internal', 'pkg', 'cmd', 'service', 'services'):
+        for src in ('internal', 'pkg', 'cmd', 'service', 'services', 'api', 'handler', 'handlers'):
             d = root / src
             if d.exists():
                 for item in sorted(d.iterdir()):
