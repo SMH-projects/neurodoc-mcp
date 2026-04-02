@@ -1596,11 +1596,11 @@ _MERMAID_INIT = ('%%{init: {"theme": "base", "themeVariables": {'
                  '"primaryColor": "#1e1e2e", "primaryTextColor": "#cdd6f4", '
                  '"primaryBorderColor": "#89b4fa", "lineColor": "#89b4fa", '
                  '"secondaryColor": "#181825", "tertiaryColor": "#313244", '
-                 '"background": "#1e1e2e", "mainBkg": "#1e1e2e", '
+                 '"background": "#1e1e2e", "mainBkg": "#313244", '
                  '"nodeBorder": "#89b4fa", "clusterBkg": "#1e1e2e", '
                  '"clusterBorder": "#585b70", "titleColor": "#cdd6f4", '
                  '"edgeLabelBackground": "#313244", '
-                 '"fontFamily": "ui-monospace, monospace", "fontSize": "14px"'
+                 '"fontFamily": "ui-monospace, monospace"'
                  '}}}%%')
 
 _CLASSDEFS = [
@@ -1645,17 +1645,29 @@ _CAT_CSS = {
 }
 
 _REL_LABELS = {
-    'Database': 'SQL/reads/writes', 'Cache': 'cache ops',
-    'Queue': 'pub / sub', 'Analytics DB': 'analytics writes',
-    'OAuth': 'OAuth2 flow', 'Auth': 'auth tokens',
-    'Storage': 'file storage', 'CDN/DNS': 'CDN · DNS · API',
-    'Monitoring': 'errors · traces', 'Alerting': 'webhooks',
-    'Analytics': 'track events', 'CRM': 'user events',
-    'Realtime': 'broadcast', 'Push': 'push notify',
-    'Payments': 'payment API', 'Email': 'send email',
-    'SMS': 'send SMS', 'KYC': 'identity verify',
-    'Microservice': 'HTTP · gRPC', 'Finance': 'rate feed',
-    'AI': 'inference API', 'Maps': 'map API', 'Search': 'search queries',
+    'Database':    'SQL (чтение/запись данных)',
+    'Cache':       'GET/SET (кеш и сессии)',
+    'Queue':       'AMQP (dispatch / consume jobs)',
+    'Analytics DB':'HTTP (запись аналитических событий)',
+    'OAuth':       'OAuth2 (аутентификация, получение токена)',
+    'Auth':        'OAuth2 (проверка учётных данных)',
+    'Storage':     'S3 API (загрузка документов)',
+    'CDN/DNS':     'REST API (управление DNS, CF-proxy)',
+    'Monitoring':  'HTTPS SDK (отправка исключений с breadcrumbs)',
+    'Alerting':    'Webhook (критические алерты)',
+    'Analytics':   'REST (идентификация, сегментация пользователей)',
+    'CRM':         'REST (user events, CDP)',
+    'Realtime':    'WebSocket SDK (broadcast событий)',
+    'Push':        'SDK (push-уведомления)',
+    'Payments':    'HTTP (инициация / статус платежа)',
+    'Email':       'SMTP / API (отправка писем)',
+    'SMS':         'HTTP API (отправка SMS)',
+    'KYC':         'HTTP (отправка документов на верификацию)',
+    'Microservice':'HTTP/gRPC (вызов микросервиса)',
+    'Finance':     'REST (получение курсов валют)',
+    'AI':          'HTTP API (inference запросы)',
+    'Maps':        'REST (геокодирование)',
+    'Search':      'HTTP Scout (полнотекстовый поиск)',
 }
 
 
@@ -1670,42 +1682,58 @@ def _make_l1(project_name, framework, actors, integrations):
     stack = f"{fw} · {lang}" + (f" {ver}" if ver else '')
     sys_alias = c4_alias(project_name)
 
-    lines = ['```mermaid', _MERMAID_INIT, 'graph TB']
-    lines += _classdefs_block()
+    lines = ['```mermaid', _MERMAID_INIT, 'flowchart TB']
+    lines.append('')
+
+    # Actors
+    lines.append('    %% ── Actors ──────────────────────────────────────────────────────────')
+    for a in actors:
+        lines.append(f'    {a["alias"]}["{a["name"]}\\n───────────────\\n{a.get("role", a["name"])}"]')
     lines.append('')
 
     # Central system node
-    lines.append(f'    {sys_alias}["🏗️ **{project_name}**\\n─────────────────\\n{stack}"]:::system')
+    lines.append('    %% ── System ──────────────────────────────────────────────────────────')
+    lines.append(f'    {sys_alias}["{project_name}\\n━━━━━━━━━━━━━━━━━━\\nSystem\\n\\n{stack}"]')
     lines.append('')
 
-    # Actors subgraph
-    lines.append('    subgraph ACTORS["👥 Users & Clients"]')
-    for a in actors:
-        lines.append(f'        {a["alias"]}["{a["icon"]} {a["name"]}"]:::actor')
-    lines.append('    end')
-    lines.append('')
-
-    # Integration subgraphs per category
+    # External systems
     cat_groups = {}
     for intg in integrations:
         cat_groups.setdefault(intg['category'], []).append(intg)
 
+    lines.append('    %% ── External Systems ────────────────────────────────────────────────')
     for cat, items in cat_groups.items():
-        grp = c4_alias(cat.replace('/', '_'))
-        lines.append(f'    subgraph {grp}["{cat}"]')
         for item in items:
-            css = _CAT_CSS.get(cat, 'external')
-            lines.append(f'        {item["alias"]}["{item["icon"]} {item["name"]}"]:::{css}')
-        lines.append('    end')
-        lines.append('')
-
-    # Arrows
-    for a in actors:
-        lines.append(f'    {a["alias"]} -->|"HTTP / HTTPS"| {sys_alias}')
+            lines.append(f'    {item["alias"]}["{item["name"]}\\n───────────────\\n{cat}"]')
     lines.append('')
+
+    # Actor → System arrows (business actions)
+    lines.append('    %% ── Actor flows ─────────────────────────────────────────────────────')
+    for a in actors:
+        action = a.get('business_action', 'HTTPS (использует систему)')
+        lines.append(f'    {a["alias"]} -- "{action}" --> {sys_alias}')
+    lines.append('')
+
+    # System → External arrows (protocol + action)
+    lines.append('    %% ── System → External flows ─────────────────────────────────────────')
     for intg in integrations:
-        label = _REL_LABELS.get(intg['category'], 'uses')
-        lines.append(f'    {sys_alias} -->|"{label}"| {intg["alias"]}')
+        label = _REL_LABELS.get(intg['category'], 'HTTP (использует)')
+        lines.append(f'    {sys_alias} -- "{label}" --> {intg["alias"]}')
+
+    lines.append('')
+    lines.append('    %% ── Styles ──────────────────────────────────────────────────────────')
+    lines.append('    classDef actor fill:#89dceb,stroke:#74c7ec,color:#1e1e2e,font-weight:bold')
+    lines.append('    classDef system fill:#89b4fa,stroke:#74c7ec,color:#1e1e2e,font-weight:bold')
+    lines.append('    classDef external fill:#313244,stroke:#585b70,color:#a6adc8')
+    lines.append('')
+
+    actor_aliases = ','.join(a['alias'] for a in actors)
+    ext_aliases = ','.join(i['alias'] for i in integrations)
+    if actor_aliases:
+        lines.append(f'    class {actor_aliases} actor')
+    lines.append(f'    class {sys_alias} system')
+    if ext_aliases:
+        lines.append(f'    class {ext_aliases} external')
 
     lines.append('```')
     return '\n'.join(lines)
@@ -1718,6 +1746,33 @@ _CONTAINER_CSS = {
     'Cache': 'cache', 'Queue': 'queue', 'Analytics DB': 'analytdb',
     'Storage': 'storage', 'Search': 'database', 'Monitoring': 'monitoring',
     'Time-Series': 'analytdb',
+}
+
+# Role descriptions for container nodes (shown inside the node label)
+_CONTAINER_ROLES = {
+    'App':          'HTTP API · бизнес-логика',
+    'Proxy':        'Reverse Proxy · TLS termination',
+    'Database':     'Основная реляционная БД · Read/Write',
+    'Cache':        'Кеш данных и сессий',
+    'Queue':        'Маршрутизирует асинхронные сообщения',
+    'Analytics DB': 'Write-optimized аналитика',
+    'Storage':      'Объектное хранилище файлов',
+    'Search':       'Полнотекстовый поиск',
+    'Time-Series':  'Временные ряды и метрики',
+    'Monitoring':   'Мониторинг и алерты',
+}
+
+# Arrow labels for L2: protocol (action)
+_L2_REL_LABELS = {
+    'Database':     'SQL (читает/пишет данные)',
+    'Cache':        'GET/SET (кеш, сессии)',
+    'Queue':        'AMQP (dispatch jobs)',
+    'Analytics DB': 'HTTP (запись аналитических событий)',
+    'Storage':      'S3 API (загрузка/чтение файлов)',
+    'CDN/DNS':      'REST API (управление DNS, прокси)',
+    'Search':       'HTTP Scout (полнотекстовый поиск)',
+    'Time-Series':  'HTTP (запись метрик)',
+    'Monitoring':   'HTTPS SDK (репортинг ошибок)',
 }
 
 
@@ -1742,17 +1797,23 @@ def _make_l2(project_name, framework, containers, integrations):
     if not containers:
         containers = _infer_containers(framework, integrations)
 
-    lines = ['```mermaid', _MERMAID_INIT, 'graph TD']
-    lines += _classdefs_block()
+    lines = ['```mermaid', _MERMAID_INIT, 'flowchart TB']
     lines.append('')
 
-    lines.append(f'    subgraph SYS["{project_name} — Infrastructure"]')
+    lines.append('    %% ── Actors ──────────────────────────────────────────────────────────')
+    lines.append('    Player["Пользователь\\n(веб / мобильный клиент)"]')
+    lines.append('    Admin["Администратор\\n(Admin Panel)"]')
+    lines.append('')
+
+    lines.append(f'    %% ══════════════════════════════════════════════════════════════════')
+    lines.append(f'    subgraph SYS["  {project_name} — System Boundary  "]')
     for c in containers:
         alias = c4_alias(c['name'])
-        port = f"\\n:{c['port']}" if c.get('port') else ''
-        lbl = f"{c.get('icon','📦')} **{c['name']}**\\n{c.get('tech', c['name'])}{port}"
-        css = _CONTAINER_CSS.get(c['type'], 'app')
-        lines.append(f'        {alias}["{lbl}"]:::{css}')
+        port = f" · порт {c['port']}" if c.get('port') else ''
+        tech = c.get('tech', c['name'])
+        role = _CONTAINER_ROLES.get(c['type'], 'Компонент системы')
+        lbl = f"{c['name']}\\n━━━━━━━━━━━━\\n{role}\\n{tech}{port}"
+        lines.append(f'        {alias}["{lbl}"]')
     lines.append('    end')
     lines.append('')
 
@@ -1760,34 +1821,94 @@ def _make_l2(project_name, framework, containers, integrations):
     ext_cats = {'Database', 'Cache', 'Queue', 'Analytics DB', 'Storage', 'CDN/DNS', 'Search', 'Time-Series'}
     ext = [i for i in integrations if i['category'] in ext_cats]
     if ext:
-        lines.append('    subgraph EXT["☁️ External Infrastructure"]')
+        lines.append('    %% ── External Systems ────────────────────────────────────────────')
         for i in ext:
-            css = _CAT_CSS.get(i['category'], 'external')
-            lines.append(f'        {i["alias"]}["{i["icon"]} {i["name"]}"]:::{css}')
-        lines.append('    end')
+            cat = i['category']
+            role = _CONTAINER_ROLES.get(cat, cat)
+            lines.append(f'    {i["alias"]}["{i["name"]}\\n({role})"]')
         lines.append('')
 
-    # Relationships
+    # Actor → proxy/app arrows
     alias_map = {c['name']: c4_alias(c['name']) for c in containers}
     proxy = next((c for c in containers if c['type'] == 'Proxy'), None)
-    app = next((c for c in containers if c['type'] == 'App' and c.get('has_build')), None)
+    app = next((c for c in containers if c['type'] == 'App' and c.get('has_build')
+                and 'worker' not in c['name'].lower() and 'scheduler' not in c['name'].lower()), None)
     worker = next((c for c in containers if c['type'] == 'App' and 'worker' in c['name'].lower()), None)
+    scheduler = next((c for c in containers if 'scheduler' in c['name'].lower()), None)
     db = next((c for c in containers if c['type'] == 'Database'), None)
     cache = next((c for c in containers if c['type'] == 'Cache'), None)
     queue = next((c for c in containers if c['type'] == 'Queue'), None)
 
+    entry = alias_map.get(proxy['name']) if proxy else (alias_map.get(app['name']) if app else None)
+
+    lines.append('    %% ── Actor → Entry ────────────────────────────────────────────────')
+    if entry:
+        lines.append(f'    Player -- "HTTPS (API-запросы: авторизация, данные)" --> {entry}')
+        lines.append(f'    Admin -- "HTTPS (управление, мониторинг)" --> {entry}')
+    lines.append('')
+
+    lines.append('    %% ── Internal flows ──────────────────────────────────────────────')
     if proxy and app:
-        lines.append(f'    {alias_map[proxy["name"]]} -->|"routes HTTP"| {alias_map[app["name"]]}')
+        lines.append(f'    {alias_map[proxy["name"]]} -- "HTTP (проксирует все запросы)" --> {alias_map[app["name"]]}')
     if app and db:
-        lines.append(f'    {alias_map[app["name"]]} -->|"SQL queries"| {alias_map[db["name"]]}')
+        lines.append(f'    {alias_map[app["name"]]} -- "SQL (чтение/запись профилей, транзакций)" --> {alias_map[db["name"]]}')
     if app and cache:
-        lines.append(f'    {alias_map[app["name"]]} -->|"cache · sessions"| {alias_map[cache["name"]]}')
+        lines.append(f'    {alias_map[app["name"]]} -- "GET/SET (кеш, сессии, блокировки)" --> {alias_map[cache["name"]]}')
     if app and queue:
-        lines.append(f'    {alias_map[app["name"]]} -->|"publish jobs"| {alias_map[queue["name"]]}')
+        lines.append(f'    {alias_map[app["name"]]} -- "AMQP (dispatch jobs в очереди)" --> {alias_map[queue["name"]]}')
     if worker and queue:
-        lines.append(f'    {alias_map[queue["name"]]} -->|"consume"| {alias_map[worker["name"]]}')
+        lines.append(f'    {alias_map[queue["name"]]} -- "AMQP consume (обработка jobs)" --> {alias_map[worker["name"]]}')
     if worker and db:
-        lines.append(f'    {alias_map[worker["name"]]} -->|"reads/writes"| {alias_map[db["name"]]}')
+        lines.append(f'    {alias_map[worker["name"]]} -- "SQL (запись результатов jobs)" --> {alias_map[db["name"]]}')
+    if scheduler and app:
+        lines.append(f'    {alias_map[scheduler["name"]]} -- "artisan (запуск периодических команд)" --> {alias_map[app["name"]]}')
+
+    # App → external integrations
+    lines.append('')
+    lines.append('    %% ── App → External ──────────────────────────────────────────────')
+    for i in ext:
+        label = _L2_REL_LABELS.get(i['category'], f"HTTP (использует {i['name']})")
+        if app:
+            lines.append(f'    {alias_map[app["name"]]} -- "{label}" --> {i["alias"]}')
+
+    lines.append('')
+    lines.append('    %% ── Styles ──────────────────────────────────────────────────────')
+    lines.append('    classDef actor     fill:#89dceb,stroke:#74c7ec,color:#1e1e2e,font-weight:bold')
+    lines.append('    classDef app       fill:#89b4fa,stroke:#74c7ec,color:#1e1e2e,font-weight:bold')
+    lines.append('    classDef db        fill:#1a1a2e,stroke:#89b4fa,color:#89b4fa')
+    lines.append('    classDef cache     fill:#2e1a1a,stroke:#f38ba8,color:#f38ba8')
+    lines.append('    classDef queue     fill:#2e1e0a,stroke:#fab387,color:#fab387')
+    lines.append('    classDef proxy     fill:#313244,stroke:#89b4fa,color:#cdd6f4')
+    lines.append('    classDef external  fill:#1e1e2e,stroke:#585b70,color:#6c7086')
+    lines.append('')
+
+    # Assign styles
+    actor_nodes = 'Player,Admin'
+    lines.append(f'    class {actor_nodes} actor')
+    app_nodes = [alias_map[c['name']] for c in containers
+                 if c['type'] == 'App' and 'worker' not in c['name'].lower()
+                 and 'scheduler' not in c['name'].lower()]
+    if app_nodes:
+        lines.append(f'    class {",".join(app_nodes)} app')
+    proxy_nodes = [alias_map[c['name']] for c in containers if c['type'] == 'Proxy']
+    if proxy_nodes:
+        lines.append(f'    class {",".join(proxy_nodes)} proxy')
+    worker_nodes = [alias_map[c['name']] for c in containers
+                    if 'worker' in c['name'].lower() or 'scheduler' in c['name'].lower()]
+    if worker_nodes:
+        lines.append(f'    class {",".join(worker_nodes)} app')
+    db_nodes = [i['alias'] for i in ext if i['category'] == 'Database']
+    if db_nodes:
+        lines.append(f'    class {",".join(db_nodes)} db')
+    cache_nodes = [i['alias'] for i in ext if i['category'] == 'Cache']
+    if cache_nodes:
+        lines.append(f'    class {",".join(cache_nodes)} cache')
+    queue_nodes = [i['alias'] for i in ext if i['category'] == 'Queue']
+    if queue_nodes:
+        lines.append(f'    class {",".join(queue_nodes)} queue')
+    other_ext = [i['alias'] for i in ext if i['category'] not in {'Database', 'Cache', 'Queue'}]
+    if other_ext:
+        lines.append(f'    class {",".join(other_ext)} external')
 
     lines.append('```')
     return '\n'.join(lines)
@@ -1816,25 +1937,84 @@ _COMMON_RELS = [
     ('analytics',    ['user', 'order']),
 ]
 
+# Descriptive action labels for L3 arrows: {src_pattern: {tgt_pattern: label}}
+_L3_ACTION_LABELS = {
+    'notification': {'user': 'отправка уведомлений пользователю',
+                     'auth': 'проверка прав отправки',
+                     'payment': 'уведомление о платеже',
+                     'wallet': 'уведомление об изменении баланса'},
+    'auth':         {'user': 'аутентификация JWT/OAuth2'},
+    'payment':      {'order': 'обработка платежа заказа',
+                     'user': 'привязка платежа к профилю',
+                     'wallet': 'зачисление средств в кошелёк'},
+    'wallet':       {'user': 'атомарные операции с балансом',
+                     'transaction': 'запись транзакции'},
+    'bonus':        {'user': 'начисление / применение бонуса',
+                     'wallet': 'зачисление бонусных средств'},
+    'loyalty':      {'user': 'обновление уровня лояльности',
+                     'bonus': 'конвертация коинов в бонус'},
+    'geo':          {'user': 'IP-геолокация пользователя'},
+    'mirror':       {'geo': 'гео-ограничения для зеркал'},
+    'kyc':          {'user': 'запуск KYC верификации'},
+    'daily':        {'user': 'ежедневные награды пользователю',
+                     'bonus': 'создание бонуса за день'},
+    'order':        {'user': 'заказ привязан к профилю',
+                     'payment': 'инициация платежа'},
+    'analytics':    {'user': 'трекинг событий пользователя',
+                     'order': 'аналитика заказов'},
+}
+
 
 def _make_l3(project_name, framework, modules):
     if not modules:
         return ''
     fw = framework['name']
-    lines = ['```mermaid', _MERMAID_INIT, 'graph LR']
-    lines += _classdefs_block()
+    lines = ['```mermaid', _MERMAID_INIT, 'flowchart TB']
     lines.append('')
 
-    lines.append(f'    subgraph APP["{fw} Application"]')
+    lines.append('    %% ── External callers ────────────────────────────────────────────')
+    lines.append('    Client["Клиент\\n(API / Admin / Partner)"]')
+    lines.append('')
+
+    lines.append(f'    %% ══════════════════════════════════════════════════════════════')
+    lines.append(f'    subgraph APP["  {fw} Application  "]')
+
+    # Group modules by inferred layer
+    http_mods, service_mods, module_mods, async_mods, data_mods = [], [], [], [], []
     for mod in modules:
-        alias = c4_alias(mod['name'])
-        icon = _TYPE_ICONS.get(mod.get('type', 'module'), '📦')
-        fcount = f"\\n{mod['files']} files" if mod.get('files', 0) > 0 else ''
-        lines.append(f'        {alias}["{icon} {mod["name"]}{fcount}"]:::domain')
+        n = mod['name'].lower()
+        t = mod.get('type', 'module')
+        if any(k in n for k in ('controller', 'route', 'middleware', 'request', 'resource')):
+            http_mods.append(mod)
+        elif any(k in n for k in ('job', 'event', 'listener', 'queue', 'command')):
+            async_mods.append(mod)
+        elif any(k in n for k in ('model', 'entity', 'repository', 'repo', 'dto')):
+            data_mods.append(mod)
+        elif any(k in n for k in ('service', 'manager', 'handler')):
+            service_mods.append(mod)
+        else:
+            module_mods.append(mod)
+
+    def render_subgroup(label, mods, css):
+        if not mods:
+            return
+        lines.append(f'        subgraph {c4_alias(label)}["  {label}  "]')
+        for mod in mods:
+            alias = c4_alias(mod['name'])
+            fcount = f"\\n{mod['files']} файлов" if mod.get('files', 0) > 0 else ''
+            lines.append(f'            {alias}["{mod["name"]}{fcount}"]')
+        lines.append('        end')
+
+    render_subgroup('HTTP Layer', http_mods, 'http')
+    render_subgroup('Service Layer', service_mods, 'service')
+    render_subgroup('Business Modules', module_mods, 'module')
+    render_subgroup('Async Layer', async_mods, 'async')
+    render_subgroup('Data Layer', data_mods, 'data')
+
     lines.append('    end')
     lines.append('')
 
-    # Infer relationships
+    # Infer relationships with descriptive labels
     mod_lower = {m['name'].lower(): c4_alias(m['name']) for m in modules}
     added = set()
     for src_pat, tgt_pats in _COMMON_RELS:
@@ -1847,7 +2027,41 @@ def _make_l3(project_name, framework, modules):
                 key = (src_alias, tgt_alias)
                 if key not in added:
                     added.add(key)
-                    lines.append(f'    {src_alias} -.->|"uses"| {tgt_alias}')
+                    # Find category labels for the src/tgt
+                    action = _L3_ACTION_LABELS.get(src_pat, {}).get(tp, 'использует')
+                    lines.append(f'    {src_alias} -- "{action}" --> {tgt_alias}')
+
+    # Client → HTTP layer or first module
+    first_http = http_mods[0] if http_mods else (modules[0] if modules else None)
+    if first_http:
+        lines.append(f'    Client -- "HTTPS (все API-запросы)" --> {c4_alias(first_http["name"])}')
+
+    lines.append('')
+    lines.append('    %% ── Styles ──────────────────────────────────────────────────────')
+    lines.append('    classDef caller  fill:#89dceb,stroke:#74c7ec,color:#1e1e2e,font-weight:bold')
+    lines.append('    classDef http    fill:#a6e3a1,stroke:#40a02b,color:#1e1e2e')
+    lines.append('    classDef service fill:#89b4fa,stroke:#74c7ec,color:#1e1e2e')
+    lines.append('    classDef module  fill:#f9e2af,stroke:#fab387,color:#1e1e2e')
+    lines.append('    classDef async   fill:#fab387,stroke:#fe640b,color:#1e1e2e')
+    lines.append('    classDef data    fill:#a6e3a1,stroke:#40a02b,color:#1e1e2e')
+    lines.append('')
+    lines.append('    class Client caller')
+
+    all_http_aliases = [c4_alias(m['name']) for m in http_mods]
+    all_svc_aliases = [c4_alias(m['name']) for m in service_mods]
+    all_mod_aliases = [c4_alias(m['name']) for m in module_mods]
+    all_async_aliases = [c4_alias(m['name']) for m in async_mods]
+    all_data_aliases = [c4_alias(m['name']) for m in data_mods]
+    if all_http_aliases:
+        lines.append(f'    class {",".join(all_http_aliases)} http')
+    if all_svc_aliases:
+        lines.append(f'    class {",".join(all_svc_aliases)} service')
+    if all_mod_aliases:
+        lines.append(f'    class {",".join(all_mod_aliases)} module')
+    if all_async_aliases:
+        lines.append(f'    class {",".join(all_async_aliases)} async')
+    if all_data_aliases:
+        lines.append(f'    class {",".join(all_data_aliases)} data')
 
     lines.append('```')
     return '\n'.join(lines)
@@ -1892,36 +2106,73 @@ def _make_l4(root, framework, modules):
         'C#': '.cs', 'Elixir': '.ex',
     }
     ext = ext_map.get(framework['language'], '.php')
-    groups = {}
+
+    # Classify files into two groups: service layer vs data layer
+    service_keywords = {'service', 'manager', 'handler', 'orchestrat',
+                        'controller', 'middleware', 'listener', 'command'}
+    data_keywords = {'model', 'entity', 'reposit', 'repo', 'store',
+                     'job', 'event', 'dto', 'migration', 'factory', 'seeder'}
+
+    service_files: dict[str, list[str]] = {}
+    data_files: dict[str, list[str]] = {}
+
     for f in tpath.rglob(f'*{ext}'):
         try:
             rel = f.relative_to(tpath)
             grp = str(rel.parent) if len(rel.parts) > 1 else 'root'
-            groups.setdefault(grp, []).append(f.name)
+            fname_lower = f.name.lower()
+            grp_lower = grp.lower()
+            is_service = any(k in fname_lower or k in grp_lower for k in service_keywords)
+            is_data = any(k in fname_lower or k in grp_lower for k in data_keywords)
+            if is_service and not is_data:
+                service_files.setdefault(grp, []).append(f.name)
+            else:
+                data_files.setdefault(grp, []).append(f.name)
         except ValueError:
             pass
-    if not groups:
+
+    if not service_files and not data_files:
         return target['name'], ''
 
-    lines = ['```mermaid', _MERMAID_INIT, 'graph TB']
-    lines += _classdefs_block()
-    lines.append('')
+    mod_name = target['name']
+    parts = []
 
-    for grp, files in sorted(groups.items()):
-        glbl = target['name'] if grp == 'root' else grp.replace('/', ' › ')
-        ga = c4_alias(f"{target['name']}_{grp}")
-        lines.append(f'    subgraph {ga}["{glbl}"]')
-        for fname in sorted(files[:12]):
-            base = fname.replace(ext, '')
-            fa = c4_alias(f"{target['name']}_{base}")
-            css = _guess_css(fname, grp)
-            icon = _FILE_ICONS.get(css, '📦')
-            lines.append(f'        {fa}["{icon} {base}"]:::{css}')
-        lines.append('    end')
-        lines.append('')
+    def _build_classdiagram(title: str, description: str, groups: dict[str, list[str]]) -> str:
+        if not groups:
+            return ''
+        d = [f'## Диаграмма: {title}', '', description, '']
+        d += ['```mermaid', _MERMAID_INIT, 'classDiagram']
+        class_names = []
+        for grp, files in sorted(groups.items()):
+            for fname in sorted(files[:10]):
+                base = fname.replace(ext, '')
+                css = _guess_css(fname, grp)
+                # Build a simple class entry showing the file role
+                role_comment = css.capitalize()
+                d.append(f'    class {c4_alias(base)} {{')
+                d.append(f'        <<{role_comment}>>')
+                d.append(f'        +{base}')
+                d.append('    }')
+                class_names.append((c4_alias(base), css))
+        # Add note about which module these belong to
+        if class_names:
+            d.append(f'    note "Module: {mod_name}"')
+        d.append('```')
+        return '\n'.join(d)
 
-    lines.append('```')
-    return target['name'], '\n'.join(lines)
+    svc_diagram = _build_classdiagram(
+        f'{mod_name} — Service Layer',
+        'Оркестрация, сервисы, контроллеры и обработчики событий.',
+        service_files,
+    )
+    data_diagram = _build_classdiagram(
+        f'{mod_name} — Data Layer',
+        'Модели (Eloquent), репозитории, Jobs и DTOs.',
+        data_files,
+    )
+
+    combined = '\n\n'.join(filter(None, [svc_diagram, data_diagram]))
+    return mod_name, combined
 
 
 # ── MCP Tool ──────────────────────────────────────────────────────────────────
